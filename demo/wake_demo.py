@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import queue
 import sys
 import threading
@@ -97,8 +98,9 @@ class EnergyVAD:
             # 只在非语音时更新噪声底（保护跟踪器不被语音拉偏）
             self.noise_floor = (1 - self.alpha) * self.noise_floor + self.alpha * rms
         return speech
-RING_SECONDS = 3
-REPLAY_SECONDS = 2.5
+RING_SECONDS = 8          # 环形缓冲：8s 历史，避免长句头被截
+REPLAY_SECONDS = 3.5      # 唪醒命中时已累积的历史时长（向前看）
+POSTROLL_SECONDS = 2.0    # 唪醒后继续录 2s 才送 ASR（向后看，保全句尾）
 LISTEN_TIMEOUT_S = 8.0
 
 
@@ -290,6 +292,7 @@ class WakeDemo:
         # ASR（按需懒加载）
         self.wake_count = 0
         self._asr_model = None
+        self._asr_backend = None
         self._asr_lock = threading.Lock()
         self._asr_pool = []  # 简单的后台线程列表（用完丢弃）
 
@@ -324,36 +327,71 @@ class WakeDemo:
                 pass
 
     def _get_asr(self):
-        """懒加载 faster-whisper，首次调用会较慢（下载/加载模型）。"""
+        """懒加载 ASR 模型。
+        优先用 sherpa-onnx + SenseVoiceSmall（中文识别准确率显著优于 whisper tiny/base），
+        如未安装或模型文件缺失则回退到 faster-whisper。
+        返回 (model, backend_name) 二元组，backend_name ∈ {'sensevoice','whisper',None}。
+        """
         with self._asr_lock:
             if self._asr_model is not None:
-                return self._asr_model
+                return self._asr_model, self._asr_backend
+            # 首选 SenseVoice
+            sv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "models", "sherpa-onnx-sense-voice")
+            sv_model = os.path.join(sv_dir, "model.int8.onnx")
+            sv_tokens = os.path.join(sv_dir, "tokens.txt")
+            if os.path.isfile(sv_model) and os.path.isfile(sv_tokens):
+                try:
+                    import sherpa_onnx
+                    print(f"[ASR] 加载 sherpa-onnx SenseVoiceSmall ...")
+                    self._asr_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                        model=sv_model,
+                        tokens=sv_tokens,
+                        num_threads=2,
+                        use_itn=True,
+                        language="zh",
+                    )
+                    self._asr_backend = "sensevoice"
+                    print("[ASR] SenseVoice 加载完成")
+                    return self._asr_model, self._asr_backend
+                except Exception as e:
+                    print(f"[ASR] SenseVoice 加载失败，回退 whisper: {e}",
+                          file=sys.stderr)
+            # 回退：faster-whisper
             try:
                 from faster_whisper import WhisperModel
             except ImportError:
                 print("[ASR] faster-whisper 未安装，跳过转写", file=sys.stderr)
-                return None
-            model_size = getattr(self.args, "asr_model", "tiny")
+                return None, None
+            model_size = getattr(self.args, "asr_model", "base")
             try:
                 print(f"[ASR] 加载 faster-whisper({model_size}) ...")
                 self._asr_model = WhisperModel(
                     model_size, device="cpu", compute_type="int8"
                 )
-                print("[ASR] 加载完成")
+                self._asr_backend = "whisper"
+                print("[ASR] Whisper 加载完成")
             except Exception as e:
                 print(f"[ASR] 加载失败: {e}", file=sys.stderr)
                 self._asr_model = None
-            return self._asr_model
+                self._asr_backend = None
+            return self._asr_model, self._asr_backend
 
     def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float):
         """在后台线程做语音转文字，完成后 emit 'asr' 事件。
         若识别结果为空或无实际意义，回推"撤销唤醒"（wake_count-1），并在事件中
         带 rejected=True + reject_reason，供 GUI 展示。
         """
-        wake_count_snapshot = self.wake_count  # 记录本次对应的计数
+    def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float,
+                          wake_count: int | None = None):
+        """在后台线程做语音转文字，完成后 emit 'asr' 事件。
+        优先用 SenseVoice，失败时回退 whisper。
+        """
+        wake_count_snapshot = self.wake_count if wake_count is None else wake_count
 
         def _job():
-            model = self._get_asr()
+            pair = self._get_asr()
+            model, backend = pair if pair else (None, None)
             if model is None:
                 self._reject_wake(wake_count_snapshot)
                 self._emit("asr", word=name, score=score, text="",
@@ -363,23 +401,41 @@ class WakeDemo:
                 return
             try:
                 audio_f = pcm_i16.astype(np.float32) / 32768.0
-                segments, info = model.transcribe(
-                    audio_f,
-                    language="zh",
-                    beam_size=1,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
-                text = "".join(seg.text for seg in segments).strip()
-                print(f"[ASR] 识别结果: {text!r}")
+                # 峰值归一化，提升低音量下的识别率
+                peak = float(np.max(np.abs(audio_f))) if audio_f.size else 0.0
+                if 0 < peak < 0.5:
+                    audio_f = audio_f * min(3.0, 0.8 / peak)
+
+                if backend == "sensevoice":
+                    s = model.create_stream()
+                    s.accept_waveform(SAMPLE_RATE, audio_f)
+                    model.decode_stream(s)
+                    text = (s.result.text or "").strip()
+                    lang_detected = getattr(s.result, "lang", None)
+                else:  # whisper
+                    segments, info = model.transcribe(
+                        audio_f,
+                        language="zh",
+                        beam_size=5,
+                        best_of=5,
+                        temperature=[0.0, 0.2, 0.4],
+                        vad_filter=False,
+                        condition_on_previous_text=False,
+                        no_speech_threshold=0.45,
+                        initial_prompt="以下是用户对智能助手的中文指令。",
+                    )
+                    text = "".join(seg.text for seg in segments).strip()
+                    lang_detected = getattr(info, "language", None)
+
+                print(f"[ASR/{backend}] 识别结果: {text!r}")
                 rejected, reject_reason = _asr_is_meaningless(text)
                 if rejected:
                     self._reject_wake(wake_count_snapshot)
                     print(f"[ASR] 判定为无效唤醒: {reject_reason}")
                 self._emit("asr", word=name, score=score, text=text,
-                           count=wake_count_snapshot,
+                           count=wake_count_snapshot, backend=backend,
                            rejected=rejected, reject_reason=reject_reason,
-                           language=getattr(info, "language", None))
+                           language=lang_detected)
             except Exception as e:
                 print(f"[ASR] 转写失败: {e}", file=sys.stderr)
                 self._reject_wake(wake_count_snapshot)
@@ -402,13 +458,26 @@ class WakeDemo:
             self._emit("state", state=self.state, reason="asr_rejected")
 
     def _on_wake(self, name: str, score: float):
-        history = self.ring.read_last(REPLAY_SECONDS)
-        dur = len(history) / SAMPLE_RATE
+        """唪醒命中。立即 emit wake 事件；ASR 延迟 POSTROLL 秒再启动，
+        等到环形缓冲把唪醒之后的语音一起录完，保证句尾完整。"""
         self.wake_count += 1
-        print(f">>> WAKE #{self.wake_count}! word={name} score={score:.2f} | 语音 {dur:.2f}s → ASR")
-        self._emit("wake", word=name, score=score, duration=dur, count=self.wake_count)
-        # 异步转写，避免阻塞主处理循环
-        self._transcribe_async(history.copy(), name, score)
+        print(f">>> WAKE #{self.wake_count}! word={name} score={score:.2f} "
+              f"| 等待 {POSTROLL_SECONDS:.1f}s postroll 后送 ASR")
+        self._emit("wake", word=name, score=score,
+                   duration=REPLAY_SECONDS + POSTROLL_SECONDS,
+                   count=self.wake_count)
+
+        wake_count_snapshot = self.wake_count
+
+        def _delayed():
+            time.sleep(POSTROLL_SECONDS)
+            history = self.ring.read_last(REPLAY_SECONDS + POSTROLL_SECONDS)
+            dur = len(history) / SAMPLE_RATE
+            print(f"[ASR ] 取 {dur:.2f}s 音频送转写")
+            self._transcribe_async(history.copy(), name, score,
+                                   wake_count=wake_count_snapshot)
+
+        threading.Thread(target=_delayed, daemon=True).start()
 
     def run(self):
         try:
