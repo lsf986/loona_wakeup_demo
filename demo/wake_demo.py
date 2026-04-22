@@ -377,15 +377,11 @@ class WakeDemo:
                 self._asr_backend = None
             return self._asr_model, self._asr_backend
 
-    def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float):
-        """在后台线程做语音转文字，完成后 emit 'asr' 事件。
-        若识别结果为空或无实际意义，回推"撤销唤醒"（wake_count-1），并在事件中
-        带 rejected=True + reject_reason，供 GUI 展示。
-        """
     def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float,
                           wake_count: int | None = None):
         """在后台线程做语音转文字，完成后 emit 'asr' 事件。
-        优先用 SenseVoice，失败时回退 whisper。
+        优先用 SenseVoice，失败时回退 whisper；
+        若结果为空或无实际意义，调用 _reject_wake 回滚本次唤醒并在事件里带 rejected=True。
         """
         wake_count_snapshot = self.wake_count if wake_count is None else wake_count
 
