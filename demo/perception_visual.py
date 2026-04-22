@@ -162,14 +162,15 @@ class VisualFrontend:
                         self._mouth_history.append(float(diff.mean()))
                     self._prev_mouth_gray = mouth.copy()
                     cv2.rectangle(frame, (mx1, my1), (mx2, my2), (0, 120, 255), 1)
-                    if len(self._mouth_history) >= 6:
+                    if len(self._mouth_history) >= 10:
                         arr = np.array(self._mouth_history)
-                        # 使用 std 或 max 两者之一达标即认为嘴在动，
-                        # 兼顾说话幅度较小但存在瞬时变化的情况
+                        # 双条件唇动：
+                        #  - std ≥ 阈值（内容有起伏）
+                        #  - 而且最近半秒内均值 ≥ 阈值半（排除单帧抖动）
                         lip_std = float(arr.std())
-                        lip_max = float(arr.max())
+                        recent_mean = float(arr[-10:].mean())
                         lip_moving = (lip_std >= self.lip_motion_thresh
-                                      or lip_max >= self.lip_motion_thresh * 1.8)
+                                      and recent_mean >= self.lip_motion_thresh * 0.6)
             else:
                 self._mouth_history.clear()
                 self._prev_mouth_gray = None

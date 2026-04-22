@@ -45,8 +45,8 @@ class WakeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Loona 唤醒模块 Demo")
-        self.geometry("1200x720")
-        self.minsize(1000, 640)
+        self.geometry("1080x640")
+        self.minsize(960, 560)
 
         self.engine: WakeDemo | None = None
         self.engine_thread: threading.Thread | None = None
@@ -62,139 +62,173 @@ class WakeGUI(tk.Tk):
 
     # ------------------------ UI ------------------------ #
     def _build_ui(self):
-        pad = {"padx": 6, "pady": 4}
+        pad = {"padx": 4, "pady": 2}
+        small = ("Segoe UI", 9)
 
-        # 顶部：参数
-        top = ttk.LabelFrame(self, text="参数")
-        top.pack(fill="x", **pad)
+        # ============ 上部：左(参数+实时监测) + 右(控制栏+摄像头) ============
+        upper = ttk.Frame(self)
+        upper.pack(fill="both", expand=False, padx=6, pady=(4, 2))
+        upper.columnconfigure(0, weight=0, minsize=520)
+        upper.columnconfigure(1, weight=1, minsize=280)
 
-        ttk.Label(top, text="麦克风设备:").grid(row=0, column=0, sticky="e", **pad)
-        self.cmb_device = ttk.Combobox(top, width=60, state="readonly")
-        self.cmb_device.grid(row=0, column=1, columnspan=3, sticky="we", **pad)
-        ttk.Button(top, text="刷新", command=self._refresh_devices, width=6).grid(row=0, column=4, **pad)
+        # ------- 左列：参数 -------
+        top = ttk.LabelFrame(upper, text="参数")
+        top.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
-        # 触发模式
-        ttk.Label(top, text="触发模式:").grid(row=1, column=0, sticky="e", **pad)
+        # 行 0：设备 + 基础阈值
+        ttk.Label(top, text="设备:", font=small).grid(row=0, column=0, sticky="e", **pad)
+        self.cmb_device = ttk.Combobox(top, width=28, state="readonly", font=small)
+        self.cmb_device.grid(row=0, column=1, columnspan=2, sticky="we", **pad)
+        ttk.Button(top, text="↻", command=self._refresh_devices, width=2).grid(row=0, column=3, **pad)
+
+        ttk.Label(top, text="阈值:", font=small).grid(row=0, column=4, sticky="e", **pad)
+        self.var_thresh = tk.DoubleVar(value=0.35)
+        self.scl_thresh = ttk.Scale(top, from_=0.2, to=0.9, variable=self.var_thresh,
+                                    orient="horizontal", length=90,
+                                    command=self._on_thresh_change)
+        self.scl_thresh.grid(row=0, column=5, sticky="we", **pad)
+        self.lbl_thresh_val = ttk.Label(top, text="0.35", width=4, font=small)
+        self.lbl_thresh_val.grid(row=0, column=6, sticky="w", **pad)
+
+        # 行 1：触发模式（单选）+ 调试复选
+        ttk.Label(top, text="模式:", font=small).grid(row=1, column=0, sticky="e", **pad)
         self.var_mode = tk.StringVar(value="multimodal")
         mode_frame = ttk.Frame(top)
-        mode_frame.grid(row=1, column=1, columnspan=4, sticky="w", **pad)
-        ttk.Radiobutton(mode_frame, text="多模态 (注视+唇动+DOA+近场)", variable=self.var_mode,
-                        value="multimodal", command=self._on_mode_change).pack(side="left", padx=4)
-        ttk.Radiobutton(mode_frame, text="无唤醒词 (VAD 意图)", variable=self.var_mode,
-                        value="vad", command=self._on_mode_change).pack(side="left", padx=4)
-        ttk.Radiobutton(mode_frame, text="唤醒词 (KWS)", variable=self.var_mode,
-                        value="kws", command=self._on_mode_change).pack(side="left", padx=4)
+        mode_frame.grid(row=1, column=1, columnspan=6, sticky="w", **pad)
+        ttk.Radiobutton(mode_frame, text="多模态", variable=self.var_mode,
+                        value="multimodal", command=self._on_mode_change).pack(side="left")
+        ttk.Radiobutton(mode_frame, text="VAD", variable=self.var_mode,
+                        value="vad", command=self._on_mode_change).pack(side="left", padx=6)
+        ttk.Radiobutton(mode_frame, text="KWS", variable=self.var_mode,
+                        value="kws", command=self._on_mode_change).pack(side="left")
+        self.var_no_vad = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="关VAD门控",
+                        variable=self.var_no_vad).pack(side="left", padx=10)
+        self.var_tts = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="模拟TTS",
+                        variable=self.var_tts, command=self._on_tts_toggle).pack(side="left")
 
-        # KWS 子面板
-        self.kws_frame = ttk.Frame(top)
-        self.kws_frame.grid(row=2, column=0, columnspan=5, sticky="we", **pad)
-        ttk.Label(self.kws_frame, text="唤醒词:").pack(side="left", padx=4)
-        self.cmb_wake = ttk.Combobox(self.kws_frame, values=AVAILABLE_WAKEWORDS,
-                                      state="readonly", width=18)
+        # 唤醒词（隐藏 UI，仍保留变量用于 KWS 模式启动）
+        self.cmb_wake = ttk.Combobox(self, values=AVAILABLE_WAKEWORDS,
+                                     state="readonly", width=14)
         self.cmb_wake.set("hey_jarvis")
-        self.cmb_wake.pack(side="left", padx=4)
+        # 不 pack/grid 到窗口 → 不显示
 
-        # VAD 子面板
+        # 行 2：VAD 子参数
         self.vad_frame = ttk.Frame(top)
-        self.vad_frame.grid(row=3, column=0, columnspan=5, sticky="we", **pad)
-        ttk.Label(self.vad_frame, text="最小语音时长(ms):").pack(side="left", padx=4)
-        self.var_min_speech = tk.IntVar(value=250)
+        self.vad_frame.grid(row=2, column=0, columnspan=7, sticky="we", **pad)
+        ttk.Label(self.vad_frame, text="语音≥(ms):", font=small).pack(side="left")
+        self.var_min_speech = tk.IntVar(value=400)
         ttk.Spinbox(self.vad_frame, from_=150, to=2000, increment=50,
-                    textvariable=self.var_min_speech, width=6).pack(side="left", padx=4)
-        ttk.Label(self.vad_frame, text="最小 SNR(dB):").pack(side="left", padx=12)
+                    textvariable=self.var_min_speech, width=5,
+                    font=small).pack(side="left", padx=2)
+        ttk.Label(self.vad_frame, text="SNR≥(dB):", font=small).pack(side="left", padx=(8, 0))
         self.var_min_snr = tk.DoubleVar(value=4.0)
         ttk.Spinbox(self.vad_frame, from_=0.0, to=25.0, increment=0.5,
-                    textvariable=self.var_min_snr, width=6, format="%.1f").pack(side="left", padx=4)
+                    textvariable=self.var_min_snr, width=5, font=small,
+                    format="%.1f").pack(side="left", padx=2)
 
-        # Multimodal 子面板
+        # KWS 子面板（与 vad_frame 共用一行）
+        self.kws_frame = ttk.Frame(top)
+        self.kws_frame.grid(row=3, column=0, columnspan=7, sticky="we", **pad)
+        ttk.Label(self.kws_frame, text="(KWS 模式使用默认唤醒词 hey_jarvis)",
+                  font=small, foreground="#888").pack(side="left")
+
+        # 行 4：多模态专属参数
         self.mm_frame = ttk.Frame(top)
-        self.mm_frame.grid(row=4, column=0, columnspan=5, sticky="we", **pad)
-        ttk.Label(self.mm_frame, text="近场 RMS 门限:").pack(side="left", padx=4)
-        self.var_nf_rms = tk.IntVar(value=300)
+        self.mm_frame.grid(row=4, column=0, columnspan=7, sticky="we", **pad)
+        ttk.Label(self.mm_frame, text="近场RMS:", font=small).pack(side="left")
+        self.var_nf_rms = tk.IntVar(value=400)
         ttk.Spinbox(self.mm_frame, from_=200, to=5000, increment=50,
-                    textvariable=self.var_nf_rms, width=7).pack(side="left", padx=4)
-        ttk.Label(self.mm_frame, text="DOA 锥度(±°):").pack(side="left", padx=10)
+                    textvariable=self.var_nf_rms, width=6,
+                    font=small).pack(side="left", padx=2)
+        ttk.Label(self.mm_frame, text="DOA±°:", font=small).pack(side="left", padx=(6, 0))
         self.var_doa = tk.IntVar(value=30)
         ttk.Spinbox(self.mm_frame, from_=5, to=90, increment=5,
-                    textvariable=self.var_doa, width=5).pack(side="left", padx=4)
-        ttk.Label(self.mm_frame, text="麦克风通道:").pack(side="left", padx=10)
+                    textvariable=self.var_doa, width=4,
+                    font=small).pack(side="left", padx=2)
+        ttk.Label(self.mm_frame, text="声道:", font=small).pack(side="left", padx=(6, 0))
         self.var_ch = tk.IntVar(value=2)
         ttk.Spinbox(self.mm_frame, from_=1, to=4, increment=1,
-                    textvariable=self.var_ch, width=4).pack(side="left", padx=4)
-        ttk.Label(self.mm_frame, text="摄像头:").pack(side="left", padx=10)
+                    textvariable=self.var_ch, width=3,
+                    font=small).pack(side="left", padx=2)
+        ttk.Label(self.mm_frame, text="摄像头:", font=small).pack(side="left", padx=(6, 0))
         self.var_cam = tk.IntVar(value=0)
         ttk.Spinbox(self.mm_frame, from_=0, to=4, increment=1,
-                    textvariable=self.var_cam, width=4).pack(side="left", padx=4)
+                    textvariable=self.var_cam, width=3,
+                    font=small).pack(side="left", padx=2)
         self.var_no_cam = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.mm_frame, text="禁用摄像头",
-                        variable=self.var_no_cam).pack(side="left", padx=10)
-
-        # 通用阈值 / 开关
-        ttk.Label(top, text="基础阈值:").grid(row=5, column=0, sticky="e", **pad)
-        self.var_thresh = tk.DoubleVar(value=0.5)
-        self.scl_thresh = ttk.Scale(top, from_=0.2, to=0.9, variable=self.var_thresh,
-                                     orient="horizontal", command=self._on_thresh_change)
-        self.scl_thresh.grid(row=5, column=1, columnspan=2, sticky="we", **pad)
-        self.lbl_thresh_val = ttk.Label(top, text="0.50", width=5)
-        self.lbl_thresh_val.grid(row=5, column=3, sticky="w", **pad)
-
-        self.var_no_vad = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="关闭 VAD 门控 (仅 KWS 调试)",
-                        variable=self.var_no_vad).grid(row=6, column=1, sticky="w", **pad)
-        self.var_tts = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="模拟 TTS 播报中 (阈值+0.10)",
-                        variable=self.var_tts, command=self._on_tts_toggle).grid(
-                            row=6, column=2, columnspan=2, sticky="w", **pad)
+                        variable=self.var_no_cam).pack(side="left", padx=6)
 
         top.columnconfigure(1, weight=1)
         top.columnconfigure(2, weight=1)
         self._update_mode_panels()
 
-        # 控制按钮
-        ctrl = ttk.Frame(self)
-        ctrl.pack(fill="x", **pad)
-        self.btn_start = ttk.Button(ctrl, text="▶ 开始监听", command=self.start_engine, width=14)
-        self.btn_start.pack(side="left", padx=4)
-        self.btn_stop = ttk.Button(ctrl, text="■ 停止", command=self.stop_engine, width=10, state="disabled")
-        self.btn_stop.pack(side="left", padx=4)
-        self.lbl_state = ttk.Label(ctrl, text="● IDLE", foreground="gray", font=("Consolas", 11, "bold"))
-        self.lbl_state.pack(side="left", padx=20)
-        # 唤醒计数
-        ttk.Label(ctrl, text="唤醒次数:", font=("Segoe UI", 10)).pack(side="left", padx=(20, 4))
+        # ------- 右列：控制栏 + 摄像头预览 -------
+        right = ttk.Frame(upper)
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew")
+
+        ctrl = ttk.LabelFrame(right, text="控制")
+        ctrl.pack(fill="x", pady=(0, 2))
+        ctrl_row = ttk.Frame(ctrl)
+        ctrl_row.pack(fill="x", padx=4, pady=2)
+        self.btn_start = ttk.Button(ctrl_row, text="▶ 开始", command=self.start_engine, width=8)
+        self.btn_start.pack(side="left", padx=2)
+        self.btn_stop = ttk.Button(ctrl_row, text="■ 停止", command=self.stop_engine,
+                                   width=7, state="disabled")
+        self.btn_stop.pack(side="left", padx=2)
+        self.lbl_state = ttk.Label(ctrl_row, text="● IDLE", foreground="gray",
+                                   font=("Consolas", 9, "bold"))
+        self.lbl_state.pack(side="left", padx=6)
+
+        count_row = ttk.Frame(ctrl)
+        count_row.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(count_row, text="唤醒次数:", font=small).pack(side="left")
         self.wake_count = 0
-        self.lbl_wake_count = ttk.Label(ctrl, text="0", foreground="#d62828",
-                                         font=("Consolas", 14, "bold"), width=5)
-        self.lbl_wake_count.pack(side="left")
-        self.btn_reset_count = ttk.Button(ctrl, text="清零", width=6,
-                                           command=self._reset_wake_count)
-        self.btn_reset_count.pack(side="left", padx=4)
+        self.lbl_wake_count = ttk.Label(count_row, text="0", foreground="#d62828",
+                                        font=("Consolas", 13, "bold"), width=4)
+        self.lbl_wake_count.pack(side="left", padx=2)
+        self.btn_reset_count = ttk.Button(count_row, text="清零", width=5,
+                                          command=self._reset_wake_count)
+        self.btn_reset_count.pack(side="left", padx=2)
 
-        # 实时监测区
-        mon = ttk.LabelFrame(self, text="实时监测")
-        mon.pack(fill="x", **pad)
+        cam_frame = ttk.LabelFrame(right, text="摄像头预览")
+        cam_frame.pack(fill="both", expand=True)
+        self.lbl_preview = ttk.Label(cam_frame, text="(未启动)", font=small,
+                                     width=30, anchor="center")
+        self.lbl_preview.pack(fill="both", expand=True, padx=2, pady=2)
 
-        self._add_bar(mon, "KWS 分数", "score", 0, color="#2b9348")
-        self._add_bar(mon, "动态阈值", "thresh", 1, color="#e07a00", maximum=1.0)
-        self._add_bar(mon, "SNR (dB, -30~+30)", "snr", 2, color="#5c6bc0", maximum=60)
-        self._bar_snr_offset = 30  # 把 SNR 平移后映射到 [0,60]
+        # ============ 左列：实时监测（紧凑） ============
+        mon = ttk.LabelFrame(upper, text="实时监测")
+        mon.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(2, 0))
+        upper.rowconfigure(1, weight=0)
 
-        self.lbl_vad = ttk.Label(mon, text="VAD: ---", width=14)
-        self.lbl_vad.grid(row=3, column=0, sticky="w", **pad)
-        self.lbl_word = ttk.Label(mon, text="Word: ---", width=22)
-        self.lbl_word.grid(row=3, column=1, sticky="w", **pad)
-        self.lbl_reason = ttk.Label(mon, text="Reason: ---", width=30)
-        self.lbl_reason.grid(row=3, column=2, sticky="w", **pad)
+        self._add_bar(mon, "KWS 分数", "score", 0)
+        self._add_bar(mon, "动态阈值", "thresh", 1, maximum=1.0)
+        self._add_bar(mon, "SNR (dB)", "snr", 2, maximum=60)
+        self._bar_snr_offset = 30
 
-        # 音频附加诊断：RMS / 频谱重心 / Pitch / DOA
+        status = ttk.Frame(mon)
+        status.grid(row=3, column=0, columnspan=3, sticky="we", padx=4, pady=1)
+        self.lbl_vad = ttk.Label(status, text="VAD: ---", width=11, font=small)
+        self.lbl_vad.pack(side="left")
+        self.lbl_word = ttk.Label(status, text="Word: ---", width=16, font=small,
+                                  anchor="w")
+        self.lbl_word.pack(side="left", padx=4)
+        self.lbl_reason = ttk.Label(status, text="Reason: ---", width=22, font=small,
+                                    anchor="w")
+        self.lbl_reason.pack(side="left", padx=4)
+
         self.lbl_audio_diag = ttk.Label(mon,
             text="RMS=---  centroid=---Hz  pitch=---Hz  DOA=---",
-            font=("Consolas", 9), foreground="#555")
-        self.lbl_audio_diag.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+            font=("Consolas", 8), foreground="#555")
+        self.lbl_audio_diag.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
         mon.columnconfigure(1, weight=1)
 
-        # 硬门限状态灯
+        # ============ 硬门限灯排（全宽，紧凑） ============
         gates_frame = ttk.LabelFrame(self, text="硬门限 (多模态模式下全部命中才触发)")
-        gates_frame.pack(fill="x", **pad)
+        gates_frame.pack(fill="x", padx=6, pady=2)
         self.gate_labels = {}
         self.gate_names = {
             "voiced": "浊音", "snr": "SNR", "speech_run": "语音时长",
@@ -203,43 +237,44 @@ class WakeGUI(tk.Tk):
             "av_sync": "唇声同步",
         }
         for i, (k, label) in enumerate(self.gate_names.items()):
-            lbl = ttk.Label(gates_frame, text=f"○ {label}", width=12,
-                            font=("Segoe UI", 10), foreground="#888")
-            lbl.grid(row=0, column=i, padx=6, pady=4)
+            lbl = ttk.Label(gates_frame, text=f"○ {label}", width=10,
+                            font=small, foreground="#888")
+            lbl.grid(row=0, column=i, padx=3, pady=2)
             self.gate_labels[k] = lbl
 
-        # 下方：左(日志) + 中(wav) + 右(摄像头预览)
+        # ============ 底部：日志 + ASR ============
         bot = ttk.Panedwindow(self, orient="horizontal")
-        bot.pack(fill="both", expand=True, **pad)
+        bot.pack(fill="both", expand=True, padx=6, pady=(2, 4))
 
         log_frame = ttk.LabelFrame(bot, text="事件日志")
-        self.txt_log = scrolledtext.ScrolledText(log_frame, height=16, font=("Consolas", 9))
+        self.txt_log = scrolledtext.ScrolledText(log_frame, height=6, font=("Consolas", 8))
         self.txt_log.pack(fill="both", expand=True)
-        self.txt_log.tag_config("wake", foreground="#d62828", font=("Consolas", 9, "bold"))
+        self.txt_log.tag_config("wake", foreground="#d62828", font=("Consolas", 8, "bold"))
         self.txt_log.tag_config("info", foreground="#444")
         self.txt_log.tag_config("warn", foreground="#b58105")
         bot.add(log_frame, weight=3)
 
         asr_frame = ttk.LabelFrame(bot, text="ASR 转写结果")
-        self.txt_asr = scrolledtext.ScrolledText(asr_frame, height=16, font=("Microsoft YaHei", 10), wrap="word")
+        self.txt_asr = scrolledtext.ScrolledText(asr_frame, height=6,
+                                                 font=("Microsoft YaHei", 9), wrap="word")
         self.txt_asr.pack(fill="both", expand=True)
-        self.txt_asr.tag_config("idx", foreground="#888", font=("Consolas", 9))
-        self.txt_asr.tag_config("text", foreground="#111", font=("Microsoft YaHei", 11, "bold"))
-        self.txt_asr.tag_config("meta", foreground="#666", font=("Consolas", 8))
-        self.txt_asr.tag_config("pending", foreground="#b58105", font=("Microsoft YaHei", 10, "italic"))
-        bot.add(asr_frame, weight=2)
+        self.txt_asr.tag_config("idx", foreground="#888", font=("Consolas", 8))
+        self.txt_asr.tag_config("text", foreground="#111",
+                                font=("Microsoft YaHei", 10, "bold"))
+        self.txt_asr.tag_config("meta", foreground="#666", font=("Consolas", 7))
+        self.txt_asr.tag_config("pending", foreground="#b58105",
+                                font=("Microsoft YaHei", 9, "italic"))
+        self.txt_asr.tag_config("reject", foreground="#b02a37",
+                                font=("Microsoft YaHei", 9, "italic"))
+        bot.add(asr_frame, weight=3)
 
-        cam_frame = ttk.LabelFrame(bot, text="摄像头预览")
-        self.lbl_preview = ttk.Label(cam_frame, text="(未启动)")
-        self.lbl_preview.pack(fill="both", expand=True, padx=4, pady=4)
-        bot.add(cam_frame, weight=2)
-
-    def _add_bar(self, parent, label, key, row, color="#2b9348", maximum=1.0):
-        ttk.Label(parent, text=label, width=22).grid(row=row, column=0, sticky="w", padx=6)
-        bar = ttk.Progressbar(parent, orient="horizontal", maximum=maximum, length=400)
-        bar.grid(row=row, column=1, sticky="we", padx=6, pady=2)
-        val = ttk.Label(parent, text="0.00", width=10, font=("Consolas", 9))
-        val.grid(row=row, column=2, sticky="w", padx=6)
+    def _add_bar(self, parent, label, key, row, maximum=1.0):
+        ttk.Label(parent, text=label, width=14,
+                  font=("Segoe UI", 9)).grid(row=row, column=0, sticky="w", padx=4, pady=1)
+        bar = ttk.Progressbar(parent, orient="horizontal", maximum=maximum, length=280)
+        bar.grid(row=row, column=1, sticky="we", padx=4, pady=1)
+        val = ttk.Label(parent, text="0.00", width=10, font=("Consolas", 8))
+        val.grid(row=row, column=2, sticky="w", padx=4)
         setattr(self, f"bar_{key}", bar)
         setattr(self, f"lbl_{key}", val)
 
@@ -382,8 +417,14 @@ class WakeGUI(tk.Tk):
             self.bar_snr["value"] = max(0.0, min(60.0, snr + self._bar_snr_offset))
             self.lbl_snr.config(text=f"{snr:+.1f} dB")
             self.lbl_vad.config(text=f"VAD: {'●' if pl['vad'] else '○'} {pl['vad']}")
-            self.lbl_word.config(text=f"Word: {pl['word']}")
-            self.lbl_reason.config(text=f"Reason: {pl['reason']}")
+            word_txt = str(pl['word'])
+            if len(word_txt) > 10:
+                word_txt = word_txt[:9] + "…"
+            self.lbl_word.config(text=f"Word: {word_txt}")
+            reason_txt = str(pl['reason'])
+            if len(reason_txt) > 16:
+                reason_txt = reason_txt[:15] + "…"
+            self.lbl_reason.config(text=f"Reason: {reason_txt}")
             # 音频诊断
             rms = pl.get("rms")
             centroid = pl.get("centroid")
@@ -425,6 +466,32 @@ class WakeGUI(tk.Tk):
             cnt = pl.get("count", self.wake_count)
             text = pl.get("text") or ""
             err = pl.get("error")
+            rejected = bool(pl.get("rejected"))
+            reject_reason = pl.get("reject_reason") or ""
+            if rejected:
+                # 回退 UI 计数（引擎已自减 wake_count）
+                if self.engine is not None:
+                    self.wake_count = self.engine.wake_count
+                else:
+                    self.wake_count = max(0, self.wake_count - 1)
+                self.lbl_wake_count.config(text=str(self.wake_count))
+                self._log(
+                    f"✗ 撤销唤醒 #{cnt}: {reject_reason}"
+                    + (f" | 文本={text!r}" if text else ""),
+                    "warn",
+                )
+                display = f"✗ 撤销 ({reject_reason})"
+                if text:
+                    display += f" 文本={text!r}"
+                display += "\n"
+                try:
+                    self.txt_asr.insert("end", f"    → ", "meta")
+                    self.txt_asr.insert("end", display, "reject")
+                    self.txt_asr.see("end")
+                except Exception:
+                    self.txt_asr.insert("end", display, "reject")
+                    self.txt_asr.see("end")
+                return
             if err:
                 line = f"(ASR 失败: {err})\n"
                 self._log(f"ASR #{cnt} 失败: {err}", "warn")
@@ -475,7 +542,7 @@ class WakeGUI(tk.Tk):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             # 限制显示尺寸
             h, w = rgb.shape[:2]
-            target_w = 320
+            target_w = 260
             if w > target_w:
                 scale = target_w / w
                 rgb = cv2.resize(rgb, (target_w, int(h * scale)))

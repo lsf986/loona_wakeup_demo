@@ -38,6 +38,30 @@ VAD_FRAME_LEN = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 320 samples
 KWS_CHUNK_LEN = 1280  # openWakeWord 要求 80 ms (=1280 samples @16k)
 
 
+# ASR 后处理：过滤空白/无意义识别结果（多为环境噪声或同事远场语音被 whisper
+# 用常见口头禅/语气词"幻觉"出来的短文本）
+_MEANINGLESS_CHARS = set("嗯啊哦呃唉哈呀哎嘿噢哇呵咳喂哼唔呣阿噫唷唉~哦嗯啊")
+_PUNCT_CHARS = set(" \t\n\r，。！？、.,!?~～·…—-“”\"'`()（）[]【】《》:;：；")
+
+
+def _asr_is_meaningless(text: str) -> tuple[bool, str]:
+    """判断 ASR 文本是否应被判为"无效唤醒"。
+    返回 (是否无效, 原因描述)。
+    """
+    if not text:
+        return True, "未识别出文字"
+    stripped = "".join(ch for ch in text if ch not in _PUNCT_CHARS)
+    if not stripped:
+        return True, "仅含标点/空白"
+    # 全是拟声/语气词（"嗯"、"啊"、"哦哦哦" 等）
+    if all(ch in _MEANINGLESS_CHARS for ch in stripped):
+        return True, f"仅含语气词: {stripped[:8]}"
+    # 长度过短（1 字符中文一般是识别噪声，如单独"嗯"/"啊"/"的"）
+    if len(stripped) <= 1:
+        return True, f"过短无意义: {stripped!r}"
+    return False, ""
+
+
 def _lazy_oww():
     try:
         from openwakeword.model import Model as OWWModel
@@ -197,10 +221,10 @@ class WakeArbiter:
     def register_hit(self, t: float) -> None:
         self.hit_times.append(t)
         recent = [x for x in self.hit_times if t - x <= 5.0]
-        if len(recent) >= 3:
-            self.cooldown_bonus = 0.10
-            self.cooldown_until = t + 300.0
-            print(f"[ARBITER] 进入冷却，阈值 +0.10，持续 5min")
+        if len(recent) >= 2:
+            self.cooldown_bonus = 0.15
+            self.cooldown_until = t + 60.0
+            print(f"[ARBITER] 进入冷却，阈值 +0.15，持续 60s")
 
 
 # ------------------------------ Demo Runner ------------------------------ #
@@ -232,14 +256,17 @@ class WakeDemo:
         self.speech_run_ms = 0.0
         self.silence_run_ms = 0.0
         self.last_fire = 0.0
-        # 最近 800ms 的 (voiced, lip_moving) 对，用于唇-声同步门
-        self._av_window = collections.deque(maxlen=40)  # 40 * 20ms = 800ms
+        # 最近 1000ms 的 (voiced, lip_moving) 对，用于唇-声同步门
+        self._av_window = collections.deque(maxlen=50)  # 50 * 20ms = 1000ms
+        # 最近 10 帧（200ms）DOA 是否在锥内，用于做时间迟滞，抗 GCC-PHAT 抖动
+        self._doa_window = collections.deque(maxlen=10)
         # 持续命中计数：要求硬门限连续 N 帧全绿才触发，抑制瞬时误报
         self._sustain_pass_frames = 0
 
         # 增强音频前端（多模态模式主力，其他模式也可用于近场诊断）
         self.audio_fe = AudioFrontend(
-            near_field_rms=float(getattr(args, "near_field_rms", 900.0))
+            near_field_rms=float(getattr(args, "near_field_rms", 900.0)),
+            voicing_min=0.28,
         )
 
         # 视觉前端（按需启动）
@@ -319,11 +346,20 @@ class WakeDemo:
             return self._asr_model
 
     def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float):
-        """在后台线程做语音转文字，完成后 emit 'asr' 事件。"""
+        """在后台线程做语音转文字，完成后 emit 'asr' 事件。
+        若识别结果为空或无实际意义，回推"撤销唤醒"（wake_count-1），并在事件中
+        带 rejected=True + reject_reason，供 GUI 展示。
+        """
+        wake_count_snapshot = self.wake_count  # 记录本次对应的计数
+
         def _job():
             model = self._get_asr()
             if model is None:
-                self._emit("asr", word=name, score=score, text="", error="model_unavailable")
+                self._reject_wake(wake_count_snapshot)
+                self._emit("asr", word=name, score=score, text="",
+                           count=wake_count_snapshot,
+                           rejected=True, reject_reason="ASR 模型不可用",
+                           error="model_unavailable")
                 return
             try:
                 audio_f = pcm_i16.astype(np.float32) / 32768.0
@@ -336,15 +372,34 @@ class WakeDemo:
                 )
                 text = "".join(seg.text for seg in segments).strip()
                 print(f"[ASR] 识别结果: {text!r}")
+                rejected, reject_reason = _asr_is_meaningless(text)
+                if rejected:
+                    self._reject_wake(wake_count_snapshot)
+                    print(f"[ASR] 判定为无效唤醒: {reject_reason}")
                 self._emit("asr", word=name, score=score, text=text,
+                           count=wake_count_snapshot,
+                           rejected=rejected, reject_reason=reject_reason,
                            language=getattr(info, "language", None))
             except Exception as e:
                 print(f"[ASR] 转写失败: {e}", file=sys.stderr)
-                self._emit("asr", word=name, score=score, text="", error=str(e))
+                self._reject_wake(wake_count_snapshot)
+                self._emit("asr", word=name, score=score, text="",
+                           count=wake_count_snapshot,
+                           rejected=True, reject_reason=f"转写异常: {e}",
+                           error=str(e))
 
         t = threading.Thread(target=_job, daemon=True)
         t.start()
         self._asr_pool.append(t)
+
+    def _reject_wake(self, cnt: int):
+        """回退一次唤醒计数（仅当仍为最新那次时才回退，避免并发冲突）。"""
+        if self.wake_count == cnt and cnt > 0:
+            self.wake_count = cnt - 1
+        # 立即回到 IDLE，让下一轮可以正常识别
+        if self.state == "LISTENING":
+            self.state = "IDLE"
+            self._emit("state", state=self.state, reason="asr_rejected")
 
     def _on_wake(self, name: str, score: float):
         history = self.ring.read_last(REPLAY_SECONDS)
@@ -520,26 +575,36 @@ class WakeDemo:
             vg = VisualGates(available=False, face_present=False, gaze_aligned=False,
                               near_field=False, lip_moving=False)
 
-        # 3) DOA 门限（有第二通道时生效）
-        doa_ok = True
+        # 3) DOA 门限（有第二通道时生效，且做 200ms 迟滞投票，抗相位抖动）
         if feats.doa_deg is not None:
-            doa_ok = abs(feats.doa_deg) <= self.doa_cone_deg
-        # 若无 DOA 信息，则依赖视觉 gaze（已代表方向）
+            self._doa_window.append(abs(feats.doa_deg) <= self.doa_cone_deg)
+            # 最近 10 帧中至少 6 帧在锥内才算 pass
+            if len(self._doa_window) >= 6:
+                doa_ok = sum(self._doa_window) >= 6
+            else:
+                doa_ok = False
+        else:
+            doa_ok = True  # 单通道时依赖视觉 gaze（已代表方向）
 
         # 4) 近场门限（视觉或音频至少一条通过）
         near_ok = feats.near_field_ok or (vg.available and vg.near_field)
 
-        # 5) 唇-声同步门：最近 800ms 内，"嘴动且发声"的帧占比需达标
+        # 5) 唇-声同步门：最近 1000ms 内
+        #    - “嘴动且发声”的共现帧占音频语音帧 ≥ 50%
+        #    - “发声但嘴没动”的反证帧数 ≤ 共现帧数  ← 抗同事远场语音的核心
         lip_now = bool(vg.available and vg.lip_moving)
         voiced_now = bool(feats.is_voiced)
         self._av_window.append((voiced_now, lip_now))
-        if len(self._av_window) >= 10:  # 至少 200ms 历史
+        if len(self._av_window) >= 15:  # 至少 300ms 历史
             coincide = sum(1 for v, l in self._av_window if v and l)
             voiced_cnt = sum(1 for v, _ in self._av_window if v)
             lip_cnt = sum(1 for _, l in self._av_window if l)
-            # 共现帧 ≥ 4 且占音频语音帧的 35%
-            av_sync_ok = (voiced_cnt >= 4 and lip_cnt >= 4
-                          and coincide >= max(3, int(0.35 * voiced_cnt)))
+            voiced_only = sum(1 for v, l in self._av_window if v and not l)  # 有声无唇 ≈ 同事语音
+            av_sync_ok = (
+                voiced_cnt >= 6 and lip_cnt >= 6
+                and coincide >= max(5, int(0.50 * voiced_cnt))
+                and voiced_only <= coincide  # 反证帧不能超过共现帧
+            )
         else:
             av_sync_ok = False
 
@@ -567,7 +632,7 @@ class WakeDemo:
         all_pass = all(gates.values())
 
         # 持续命中门限：要求硬门限连续 N 帧保持全绿（抗瞬时误报）
-        SUSTAIN_FRAMES = 7  # 7 * 20ms = 140ms
+        SUSTAIN_FRAMES = 10  # 10 * 20ms = 200ms
         if all_pass:
             self._sustain_pass_frames += 1
         else:
@@ -578,7 +643,7 @@ class WakeDemo:
         now = time.time()
         if all_pass and not sustained:
             reason = f"hold {self._sustain_pass_frames}/{SUSTAIN_FRAMES}"
-        elif sustained and (now - self.last_fire) < 1.5:
+        elif sustained and (now - self.last_fire) < 2.5:
             sustained = False
             reason = "veto:debounce"
         elif self.arbiter.tts_playing and sustained:
