@@ -1,0 +1,7 @@
+sounddevice>=0.4.6
+numpy>=1.23
+openwakeword>=0.6.0
+onnxruntime>=1.16
+# 多模态/预览（可选）
+opencv-python>=4.8
+pillow>=10.0
