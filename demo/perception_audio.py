@@ -103,6 +103,148 @@ def gcc_phat(sig: np.ndarray, ref: np.ndarray, sr: int = SR, max_tau: float | No
     return float(peak) / (interp * sr), strength
 
 
+class Audio3A:
+    """轻量 3A 预处理：HPF + 温和 ANS（基于 webrtc 风格的频谱门控）+ 简易 AGC。
+
+    背景：webrtc 官方 APM 的 Python 绑定（webrtc-audio-processing / webrtc-noise-gain
+    / webrtcvad）在 Python 3.14 上均无预编译 wheel 且无法从源码构建；此处采用
+    `noisereduce` 作为纯 Python 替代——它实现的"非平稳噪声谱门控"算法与
+    webrtc NS 思路一致（先建立噪声画像，再按频点做软衰减），且默认参数更温和。
+    若未安装 noisereduce，会自动退化为 HPF + AGC（不做 ANS，避免抖音）。
+
+    关键参数：
+    - `strength`（0~1）：ANS 强度。默认 0.3，远低于之前手写谱减法的 1.4 过减。
+    - `agc_target_rms`：AGC 目标 RMS（int16 域），默认 1500（≈ -23 dBFS）。
+    - `enable_aec`：是否启用 NLMS AEC；demo 无扬声器回采接口，默认关闭。
+
+    处理顺序：HPF → (AEC 可选) → ANS → AGC，全部在 float32 域进行。
+    """
+
+    def __init__(self, sr: int = SR, frame_len: int = 320,
+                 strength: float = 0.3,
+                 agc_target_rms: float = 1500.0,
+                 agc_max_gain: float = 4.0,
+                 enable_aec: bool = False,
+                 noise_profile_ms: int = 500):
+        self.sr = sr
+        self.frame_len = frame_len
+        self.strength = float(max(0.0, min(1.0, strength)))
+        self.agc_target_rms = float(agc_target_rms)
+        self.agc_max_gain = float(agc_max_gain)
+        self.enable_aec = bool(enable_aec)
+
+        # 尝试加载 noisereduce（webrtc 风格 NS 的纯 Python 替代）
+        try:
+            import noisereduce as _nr  # type: ignore
+            self._nr = _nr
+            self._ns_backend = "noisereduce"
+        except ImportError:
+            self._nr = None
+            self._ns_backend = "off"
+
+        # --- HPF (80Hz, 1 阶高通) 状态 ---
+        self._hpf_prev_x = 0.0
+        self._hpf_prev_y = 0.0
+        RC = 1.0 / (2.0 * np.pi * 80.0)
+        dt = 1.0 / sr
+        self._hpf_alpha = RC / (RC + dt)
+
+        # --- 噪声画像（前 noise_profile_ms 内的非语音帧） ---
+        self._noise_profile_ready = False
+        self._noise_profile: np.ndarray | None = None
+        self._noise_buf: list[np.ndarray] = []
+        self._noise_target_frames = max(10, int(noise_profile_ms / (1000.0 * frame_len / sr)))
+
+        # --- AGC 状态 ---
+        self._agc_gain = 1.0
+        self._agc_alpha = 0.1
+
+        # --- AEC (NLMS) 状态 ---
+        self._aec_w = np.zeros(512, dtype=np.float32)
+        self._aec_xbuf = np.zeros(512, dtype=np.float32)
+
+    @property
+    def backend(self) -> str:
+        return self._ns_backend
+
+    def _hpf(self, x: np.ndarray) -> np.ndarray:
+        y = np.empty_like(x)
+        px, py = self._hpf_prev_x, self._hpf_prev_y
+        a = self._hpf_alpha
+        for i in range(len(x)):
+            py = a * (py + x[i] - px)
+            px = x[i]
+            y[i] = py
+        self._hpf_prev_x, self._hpf_prev_y = float(px), float(py)
+        return y
+
+    def _aec(self, ref: np.ndarray, d: np.ndarray) -> np.ndarray:
+        taps = self._aec_w.size
+        out = np.empty_like(d)
+        w = self._aec_w; xbuf = self._aec_xbuf
+        mu = 0.1; eps = 1e-3
+        for n in range(len(d)):
+            xbuf[1:] = xbuf[:-1]; xbuf[0] = ref[n]
+            y_hat = float(np.dot(w, xbuf))
+            e = float(d[n] - y_hat)
+            out[n] = e
+            norm = float(np.dot(xbuf, xbuf)) + eps
+            if norm > 1e3:
+                w += (mu * e / norm) * xbuf
+        return out
+
+    def _ns(self, x: np.ndarray, is_speech_hint: bool) -> np.ndarray:
+        """webrtc 风格的频谱门控噪声抑制。仅当 noisereduce 可用且
+        噪声画像已建立时生效。帧长 20ms 时使用小 FFT（n_fft=256）。"""
+        if self._nr is None or self.strength <= 0.01:
+            return x
+        # 未建立噪声画像：只在非语音帧积累
+        if not self._noise_profile_ready:
+            if not is_speech_hint:
+                self._noise_buf.append(x.copy())
+                if len(self._noise_buf) >= self._noise_target_frames:
+                    self._noise_profile = np.concatenate(self._noise_buf)
+                    self._noise_profile_ready = True
+                    self._noise_buf.clear()
+            return x
+        try:
+            y = self._nr.reduce_noise(
+                y=x, sr=self.sr,
+                y_noise=self._noise_profile,
+                stationary=True,                    # 稳态噪声模式（风扇/空调）
+                prop_decrease=self.strength,        # 0.3 → 只衰减 30% 的噪声能量
+                n_fft=256, win_length=256, hop_length=128,
+            )
+            return y.astype(np.float32)
+        except Exception:
+            return x
+
+    def process(self, frame_i16: np.ndarray,
+                ref_i16: np.ndarray | None = None,
+                is_speech_hint: bool = False) -> np.ndarray:
+        """输入/输出都是 int16。ref_i16 为扬声器参考（可选，AEC 用）。"""
+        x = frame_i16.astype(np.float32)
+        # 1) HPF
+        x = self._hpf(x)
+        # 2) AEC（可选）
+        if self.enable_aec and ref_i16 is not None and len(ref_i16) == len(frame_i16):
+            x = self._aec(ref_i16.astype(np.float32), x)
+        # 3) ANS（webrtc 风格频谱门控，强度默认 0.3）
+        x = self._ns(x, is_speech_hint=is_speech_hint)
+        # 4) AGC（保守，避免小声放大噪声）
+        rms = float(np.sqrt(np.mean(x * x) + 1e-6))
+        if rms < 30.0:
+            tg = 1.0
+        else:
+            tg = self.agc_target_rms / rms
+            tg = min(self.agc_max_gain, max(0.5, tg))
+        self._agc_gain = (1 - self._agc_alpha) * self._agc_gain + self._agc_alpha * tg
+        x = x * self._agc_gain
+        # clip
+        np.clip(x, -32768.0, 32767.0, out=x)
+        return x.astype(np.int16)
+
+
 class AudioFrontend:
     """把整流、特征提取、近场判定收口。"""
 
@@ -138,7 +280,7 @@ class AudioFrontend:
         rms = float(np.sqrt(np.mean(y * y) + 1e-9))
         pitch, voicing = autocorr_pitch(y, self.sr)
         centroid = spectral_centroid(y, self.sr)
-        is_voiced = (voicing >= self.voicing_min) and (pitch > 0) and (rms > 80)
+        is_voiced = (voicing >= self.voicing_min) and (pitch > 0) and (rms > 50)
 
         near = (rms >= self.near_field_rms) and (self.centroid_min <= centroid <= self.centroid_max)
 

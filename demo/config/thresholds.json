@@ -1,0 +1,25 @@
+{
+  "near_field_rms": 1716.744,
+  "min_snr_db": 20.0,
+  "face_area_min": 0.119,
+  "lip_motion_thresh": 1.628,
+  "profiles": {
+    "relaxed": {
+      "weights": {
+        "gaze": 0.9,
+        "lip": 0.651,
+        "near_field": 0.713,
+        "av_sync": 0.571,
+        "snr": 0.545,
+        "doa": 0.3
+      }
+    },
+    "strict": {
+      "weights": {
+        "gaze": 1.8,
+        "doa": 1.2,
+        "av_sync": 1.142
+      }
+    }
+  }
+}

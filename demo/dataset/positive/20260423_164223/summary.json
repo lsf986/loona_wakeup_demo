@@ -1,0 +1,45 @@
+{
+  "voiced_rate": 0.5231481481481481,
+  "is_speech_rate": 0.7083333333333334,
+  "face_rate": 1.0,
+  "multi_face_rate": 0.0,
+  "gaze_rate": 1.0,
+  "lip_rate": 0.0,
+  "near_field_audio_rate": 0.2962962962962963,
+  "near_field_visual_rate": 1.0,
+  "av_sync_rate": 0.0,
+  "active_frames": 154,
+  "rms": {
+    "mean": 777.346,
+    "p15": 53.201,
+    "p50": 304.891,
+    "p85": 1582.23,
+    "p90": 2527.416
+  },
+  "snr": {
+    "mean": 35.707,
+    "p15": 16.675,
+    "p50": 33.816,
+    "p85": 55.104,
+    "p90": 59.305
+  },
+  "face_area": {
+    "mean": 0.135,
+    "p15": 0.13,
+    "p50": 0.136,
+    "p85": 0.141,
+    "p90": 0.142
+  },
+  "lip_std": {
+    "mean": 1.027,
+    "p15": 0.883,
+    "p50": 1.033,
+    "p85": 1.18,
+    "p90": 1.212
+  },
+  "label": "positive",
+  "duration_s": 4.335,
+  "frames": 216,
+  "sample_rate_hz": 50,
+  "root": "E:\\1_keyi\\wakeup\\demo\\dataset\\positive\\20260423_164223"
+}

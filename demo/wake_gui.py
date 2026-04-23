@@ -397,6 +397,19 @@ class WakeGUI(tk.Tk):
                                    font=(mono[0], 10, "bold"))
         self.lbl_state.pack(side="left", padx=6)
 
+        # 采集按钮：正/负样本 + 自动调参
+        self.is_collecting = False     # 标记当前是否在采集
+        self.collect_label = None      # 'positive' / 'negative'
+        self.btn_collect_pos = ttk.Button(ctrl_row, text="● 正样本", width=9,
+                                          command=lambda: self._toggle_collect("positive"))
+        self.btn_collect_pos.pack(side="left", padx=(12, 2))
+        self.btn_collect_neg = ttk.Button(ctrl_row, text="○ 负样本", width=9,
+                                          command=lambda: self._toggle_collect("negative"))
+        self.btn_collect_neg.pack(side="left", padx=2)
+        self.btn_auto_tune = ttk.Button(ctrl_row, text="🔧 自动调参", width=11,
+                                        command=self._run_auto_tune)
+        self.btn_auto_tune.pack(side="left", padx=(6, 2))
+
         # 右侧：唤醒次数 + 清零（右对齐）
         self.btn_reset_count = ttk.Button(ctrl_row, text="清零", width=5,
                                           command=self._reset_wake_count)
@@ -554,11 +567,9 @@ class WakeGUI(tk.Tk):
     def _on_tts_toggle(self):
         if self.engine is not None:
             self.engine.arbiter.tts_playing = bool(self.var_tts.get())
-        self._log(f"模拟 TTS 播报中 = {self.var_tts.get()}", "info")
 
     def _on_mode_change(self):
-        self._update_mode_panels()
-        self._log(f"触发模式切换为: {self.var_mode.get()}", "info")
+        self._refresh_mode_frames()
 
     def _update_mode_panels(self):
         mode = self.var_mode.get()
@@ -596,7 +607,7 @@ class WakeGUI(tk.Tk):
             asr_model="tiny",
             verbose=False,
         )
-        self._log(f"初始化引擎: mode={mode} device={device} thresh={thresh:.2f}", "info")
+        self._log(f"▶ 引擎启动 mode={mode}", "info")
         try:
             self.engine = WakeDemo(args)
         except Exception as e:
@@ -614,7 +625,6 @@ class WakeGUI(tk.Tk):
         if self.engine is None:
             return
         self.engine.stop_flag.set()
-        self._log("停止中...", "info")
         self.btn_stop.config(state="disabled")
 
     def _on_close(self):
@@ -745,21 +755,16 @@ class WakeGUI(tk.Tk):
             st = pl["state"]
             color = THEME["ok"] if st == "LISTENING" else THEME["fg_mute"]
             self.lbl_state.config(text=f"● {st}", foreground=color)
-            self._log(f"状态切换 -> {st} ({pl.get('reason', '')})", "info")
         elif ev == "started":
             self.lbl_state.config(text="● IDLE", foreground=THEME["accent"])
-            extra = ""
-            if "audio_channels" in pl:
-                extra = f" channels={pl['audio_channels']} visual={pl.get('visual_on')}"
-            self._log(f"监听启动 mode={pl.get('mode')}{extra}", "info")
         elif ev == "stopped":
             self.lbl_state.config(text="● STOPPED", foreground=THEME["fg_mute"])
-            self._log("监听已停止", "info")
+            self._log("■ 已停止", "info")
             self.engine = None
             self.btn_start.config(state="normal")
             self.btn_stop.config(state="disabled")
         elif ev == "interrupt_hint":
-            self._log(f"(LISTENING 中再触发，按方案交给打断模块) {pl['word']}={pl['score']:.2f}", "warn")
+            pass  # 打断提示无需刷日志
         elif ev == "asr_status":
             if pl.get("ok"):
                 self._log(f"ASR 就绪: backend={pl.get('backend')}", "info")
@@ -779,7 +784,21 @@ class WakeGUI(tk.Tk):
                      f"multi={pl.get('multi_ratio', 0)*100:.0f}%]",
                 foreground=color,
             )
-            self._log(f"环境画像切换: {noise}/{crowd} → {profile}", "info")
+        elif ev == "collect_start":
+            self._log(f"▶ 采集开始 [{pl.get('label')}] -> {pl.get('root')}", "info")
+        elif ev == "collect_done":
+            pass  # 已在 _toggle_collect 里日志过
+        elif ev == "auto_tune_done":
+            self.btn_auto_tune.config(state="normal")
+            code = pl.get("code")
+            out = pl.get("out") or ""
+            tag = "info" if code == 0 else "warn"
+            self._log(f"自动调参结束 (exit={code})", tag)
+            # 输出多行摘要到日志
+            for line in out.strip().splitlines()[-15:]:
+                self._log(f"  {line}", "info")
+            if code == 0:
+                self._log("提示：新阈值将在下次 ▶ 开始 时生效", "info")
 
     def _refresh_preview(self):
         self.after(100, self._refresh_preview)
@@ -814,6 +833,84 @@ class WakeGUI(tk.Tk):
         if self.engine is not None:
             self.engine.wake_count = 0
         self._log("唤醒计数已清零", "info")
+
+    # ------------------------ 样本采集 & 自动调参 ------------------------ #
+    def _toggle_collect(self, label: str):
+        """按钮切换采集状态。需要先 ▶ 开始引擎，因为音视频流来源于引擎。"""
+        if self.engine is None:
+            self._log("请先点击 ▶ 开始 启动引擎，再进行样本采集", "warn")
+            return
+        if self.is_collecting and self.collect_label != label:
+            self._log(f"当前正在采集 {self.collect_label}，请先停止再切换", "warn")
+            return
+        if not self.is_collecting:
+            try:
+                root = self.engine.start_collect(label)
+            except Exception as e:
+                self._log(f"采集启动失败: {e}", "warn")
+                return
+            if not root:
+                self._log("采集启动失败（可能已在采集中）", "warn")
+                return
+            self.is_collecting = True
+            self.collect_label = label
+            self._update_collect_buttons()
+        else:
+            try:
+                meta = self.engine.stop_collect()
+            except Exception as e:
+                self._log(f"采集保存失败: {e}", "warn")
+                meta = None
+            self.is_collecting = False
+            self.collect_label = None
+            self._update_collect_buttons()
+            if meta:
+                self._log(
+                    f"采集完成 [{meta['label']}] {meta['duration_s']:.1f}s "
+                    f"音频帧={meta['audio_frames']} 视频帧={meta['video_frames']}\n"
+                    f"    目录: {meta['root']}",
+                    "info",
+                )
+
+    def _update_collect_buttons(self):
+        if self.is_collecting and self.collect_label == "positive":
+            self.btn_collect_pos.config(text="■ 停止正采")
+            self.btn_collect_neg.config(state="disabled")
+        elif self.is_collecting and self.collect_label == "negative":
+            self.btn_collect_neg.config(text="■ 停止负采")
+            self.btn_collect_pos.config(state="disabled")
+        else:
+            self.btn_collect_pos.config(text="● 正样本", state="normal")
+            self.btn_collect_neg.config(text="○ 负样本", state="normal")
+
+    def _run_auto_tune(self):
+        """调用 auto_tune.py 统计正负样本并写入 config/thresholds.json。
+        调参后需要重新点击 ▶ 开始 才会生效（配置在 WakeDemo 构造期加载）。
+        """
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, "auto_tune.py")
+        if not os.path.isfile(script):
+            self._log(f"未找到 auto_tune.py: {script}", "warn")
+            return
+        self._log("正在运行自动调参 ...", "info")
+        self.btn_auto_tune.config(state="disabled")
+
+        def _job():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, script],
+                    cwd=here, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=60,
+                )
+                out = (proc.stdout or "") + (proc.stderr or "")
+                self.event_q.put(("auto_tune_done",
+                                  dict(code=proc.returncode, out=out)))
+            except Exception as e:
+                self.event_q.put(("auto_tune_done",
+                                  dict(code=-1, out=f"异常: {e}")))
+
+        threading.Thread(target=_job, daemon=True).start()
 
 
 def main():

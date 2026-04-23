@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
-from perception_audio import AudioFrontend, AudioFeatures
+from perception_audio import AudioFrontend, AudioFeatures, Audio3A
 from perception_visual import VisualFrontend, VisualGates, HAVE_CV2
 
 SAMPLE_RATE = 16000
@@ -95,9 +95,9 @@ class EnergyVAD:
     使用即可（方案 §3）。
     """
 
-    def __init__(self, energy_ratio_db: float = 8.0):
+    def __init__(self, energy_ratio_db: float = 5.0):
         self.energy_ratio_db = energy_ratio_db
-        self.noise_floor = 50.0  # int16 RMS
+        self.noise_floor = 40.0  # int16 RMS
         self.alpha = 0.02
 
     def is_speech(self, frame: np.ndarray) -> bool:
@@ -107,15 +107,17 @@ class EnergyVAD:
         zc = float(np.mean(np.abs(np.diff(np.signbit(f).astype(np.int8)))))
         # 阈值：高于噪声底 N dB
         thresh = self.noise_floor * (10 ** (self.energy_ratio_db / 20.0))
-        speech = (rms > thresh) and (0.01 < zc < 0.35)
+        speech = (rms > thresh) and (0.005 < zc < 0.40)
         if not speech:
             # 只在非语音时更新噪声底（保护跟踪器不被语音拉偏）
             self.noise_floor = (1 - self.alpha) * self.noise_floor + self.alpha * rms
         return speech
-RING_SECONDS = 8          # 环形缓冲：8s 历史，避免长句头被截
-REPLAY_SECONDS = 3.5      # 唪醒命中时已累积的历史时长（向前看）
-POSTROLL_SECONDS = 2.0    # 唪醒后继续录 2s 才送 ASR（向后看，保全句尾）
-LISTEN_TIMEOUT_S = 8.0
+RING_SECONDS = 12         # 环形缓冲：12s 历史，兼顾长句头和长尾
+REPLAY_SECONDS = 2.5      # 唪醒命中时已累积的历史时长（向前看）
+POSTROLL_SECONDS = 6.0    # 唪醒后最多再录 6s 才送 ASR（硬上限；实际由尾点静音决定）
+ENDPOINT_SILENCE_MS = 500 # 尾点检测：末尾连续静音 ≥ 500ms 即认为说完
+ENDPOINT_MIN_WAIT_MS = 250 # 最少等 250ms，避免把短词末尾切掉
+LISTEN_TIMEOUT_S = 10.0
 
 
 # ------------------------------ Ring Buffer ------------------------------ #
@@ -127,11 +129,13 @@ class RingBuffer:
         self.buf = np.zeros(self.cap, dtype=np.int16)
         self.wpos = 0
         self.filled = 0
+        self.total_written = 0  # 累计写入样本数，用于跨次 ASR 的边界隔离
         self.lock = threading.Lock()
 
     def write(self, data: np.ndarray) -> None:
         with self.lock:
             n = len(data)
+            self.total_written += n
             if n >= self.cap:
                 self.buf[:] = data[-self.cap:]
                 self.wpos = 0
@@ -147,9 +151,12 @@ class RingBuffer:
             self.wpos = end % self.cap
             self.filled = min(self.cap, self.filled + n)
 
-    def read_last(self, seconds: float) -> np.ndarray:
+    def read_last(self, seconds: float, max_samples: int | None = None) -> np.ndarray:
+        """读最近 seconds 的样本；若提供 max_samples 则再收紧到该样本数。"""
         with self.lock:
             n = min(int(seconds * SAMPLE_RATE), self.filled)
+            if max_samples is not None:
+                n = min(n, max(0, int(max_samples)))
             if n == 0:
                 return np.zeros(0, dtype=np.int16)
             start = (self.wpos - n) % self.cap
@@ -157,6 +164,10 @@ class RingBuffer:
                 return self.buf[start:start + n].copy()
             tail = self.cap - start
             return np.concatenate([self.buf[start:], self.buf[:n - tail]])
+
+    def snapshot_total(self) -> int:
+        with self.lock:
+            return self.total_written
 
 
 # ------------------------------ Noise / SNR ------------------------------ #
@@ -244,9 +255,69 @@ class WakeArbiter:
 
 
 # ------------------------------ Demo Runner ------------------------------ #
+def _load_tuned_config() -> dict:
+    """读取 auto_tune 生成的阈值配置（可选）。
+    文件位置: demo/config/thresholds.json。不存在则返回空字典。
+    """
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "config", "thresholds.json")
+    if not os.path.isfile(cfg_path):
+        return {}
+    try:
+        import json
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            print(f"[CFG ] 载入自适应阈值 {cfg_path}: {cfg}")
+            return cfg
+    except Exception as e:
+        print(f"[CFG ] 读取 {cfg_path} 失败: {e}", file=sys.stderr)
+    return {}
+
+
 class WakeDemo:
+    # 三档 profile 的默认策略表：必需门 / 可选门权重 / 可选分阈值 / 持续帧 / 冷却秒数
+    # auto_tune 可以通过 config/thresholds.json 的 "profiles" 字段覆盖
+    DEFAULT_PROFILES: dict = {
+        "relaxed": {
+            # 单人安静环境：只要求声/人脸在场，持续帧与冷却进一步降低
+            "required": ["voiced", "face"],
+            "weights": {"gaze": 0.9, "lip": 0.8, "near_field": 0.7,
+                         "av_sync": 0.6, "snr": 0.5, "doa": 0.3,
+                         "speech_run": 0.6},
+            "optional_thresh": 0.9,
+            "sustain_frames": 2,
+            "debounce_s": 0.6,
+        },
+        "normal": {
+            "required": ["voiced", "snr", "speech_run", "face", "gaze",
+                         "lip", "near_field", "av_sync"],
+            "weights": {},
+            "optional_thresh": 0.0,
+            "sustain_frames": 5,
+            "debounce_s": 1.5,
+        },
+        "strict": {
+            "required": ["voiced", "snr", "speech_run", "face", "gaze",
+                         "lip", "near_field", "av_sync"],
+            "weights": {"gaze": 1.8, "doa": 1.2, "av_sync": 1.2},
+            "optional_thresh": 0.0,
+            "sustain_frames": 7,
+            "debounce_s": 2.0,
+        },
+    }
+
     def __init__(self, args):
+        # 先载入自适应阈值，按 key 覆盖 args 里对应字段（仅覆盖标量字段；
+        # 结构字段如 profiles 保留在 self._tuned_cfg 里供 _resolve_profile_cfg 使用）
+        tuned = _load_tuned_config()
+        for k, v in tuned.items():
+            if k == "profiles":
+                continue
+            if hasattr(args, k) and not isinstance(v, (dict, list)):
+                setattr(args, k, v)
         self.args = args
+        self._tuned_cfg = tuned
         self.mode = getattr(args, "mode", "multimodal")  # "vad" | "kws" | "multimodal"
         self.vad = EnergyVAD()
         self.kws = None
@@ -261,6 +332,8 @@ class WakeDemo:
                   f"min_snr={getattr(args, 'min_snr_db', 6.0):.1f}dB")
 
         self.ring = RingBuffer(RING_SECONDS)
+        # 记录上一次送入 ASR 的音频截止样本，避免下一次识别把旧句的尾巴也读进来。
+        self._last_asr_end_sample = 0
         self.noise = NoiseTracker()
         self.arbiter = WakeArbiter(base_thresh=args.base_thresh)
         self.audio_q: queue.Queue = queue.Queue(maxsize=100)
@@ -289,9 +362,22 @@ class WakeDemo:
 
         # 增强音频前端（多模态模式主力，其他模式也可用于近场诊断）
         self.audio_fe = AudioFrontend(
-            near_field_rms=float(getattr(args, "near_field_rms", 900.0)),
-            voicing_min=0.28,
+            near_field_rms=float(getattr(args, "near_field_rms", 400.0)),
+            voicing_min=0.20,
         )
+
+        # 3A 预处理（HPF + webrtc 风格 ANS + AGC），默认温和强度
+        self.use_3a = not bool(getattr(args, "no_3a", False))
+        apm_strength = float(getattr(args, "apm_strength", 0.3))
+        self.audio_3a = (
+            Audio3A(sr=SAMPLE_RATE, frame_len=VAD_FRAME_LEN,
+                     strength=apm_strength)
+            if self.use_3a else None
+        )
+        if self.use_3a and self.audio_3a is not None:
+            print(f"[3A  ] backend={self.audio_3a.backend} strength={apm_strength:.2f}")
+        elif not self.use_3a:
+            print("[3A  ] disabled")
 
         # 视觉前端（按需启动）
         self.visual = None
@@ -320,6 +406,11 @@ class WakeDemo:
         self._asr_lock = threading.Lock()
         self._asr_pool = []  # 简单的后台线程列表（用完丢弃）
 
+        # ===== 数据采集：供 GUI 标注正/负样本，用于 auto_tune 迭代 =====
+        # 采集时 _loop 会把 PCM、摄像头帧、每帧特征写入 _collector；stop_collect 时落盘
+        self._collector = None  # type: dict | None
+        self._collector_lock = threading.Lock()
+
     def _emit(self, event_type: str, **payload):
         cb = self.on_event
         if cb is not None:
@@ -327,6 +418,194 @@ class WakeDemo:
                 cb(event_type, payload)
             except Exception as e:
                 print(f"[EVENT-CB-ERR] {e}", file=sys.stderr)
+
+    def _resolve_profile_cfg(self, profile: str) -> dict:
+        """返回当前 profile 的判决策略（必需门/权重/阈值/持续帧/冷却）。
+        默认值来自 DEFAULT_PROFILES；若 tuned 配置里有 "profiles" 字段，
+        则逐字段覆盖（允许部分覆盖，例如只改 weights）。
+        """
+        base = self.DEFAULT_PROFILES.get(profile, self.DEFAULT_PROFILES["normal"])
+        # 深拷贝一份避免意外修改类属性
+        cfg = {
+            "required": list(base["required"]),
+            "weights": dict(base["weights"]),
+            "optional_thresh": float(base["optional_thresh"]),
+            "sustain_frames": int(base["sustain_frames"]),
+            "debounce_s": float(base["debounce_s"]),
+        }
+        tuned_profiles = (self._tuned_cfg or {}).get("profiles") or {}
+        override = tuned_profiles.get(profile) or {}
+        if "required" in override and isinstance(override["required"], list):
+            cfg["required"] = list(override["required"])
+        if "weights" in override and isinstance(override["weights"], dict):
+            # 按键合并：允许 auto_tune 只写部分权重
+            merged = dict(cfg["weights"])
+            for k, v in override["weights"].items():
+                try:
+                    merged[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            cfg["weights"] = merged
+        for k in ("optional_thresh", "sustain_frames", "debounce_s"):
+            if k in override:
+                try:
+                    cfg[k] = type(cfg[k])(override[k])
+                except (TypeError, ValueError):
+                    pass
+        return cfg
+
+    # ------------------- 数据采集（标注正/负样本） ------------------- #
+    def start_collect(self, label: str) -> str | None:
+        """开始采集样本。label ∈ {'positive','negative'}。返回保存目录或 None。
+
+        采集策略（精简版）：
+          - 不保存原始音频 wav、不保存摄像头帧 jpg
+          - 仅在内存中累计每帧特征（注视、唇动、近场、SNR、浊音、DOA 等）
+          - stop_collect 时聚合出 summary.json（均值/占比/分位数），体积极小
+        """
+        if label not in ("positive", "negative"):
+            raise ValueError("label must be 'positive' or 'negative'")
+        with self._collector_lock:
+            if self._collector is not None:
+                return None
+            root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "dataset", label, time.strftime("%Y%m%d_%H%M%S"))
+            os.makedirs(root, exist_ok=True)
+            self._collector = dict(
+                label=label, root=root,
+                features=[],           # list of dict (每帧特征)
+                start_t=time.time(),
+            )
+        self._emit("collect_start", label=label, root=root)
+        print(f"[COLLECT] 开始采集 {label} 样本 -> {root}")
+        return root
+
+    def stop_collect(self) -> dict | None:
+        """停止采集并落盘。只保存一份聚合后的 summary.json（包含各门命中率、
+        关键特征的均值/分位数），供 auto_tune 使用。
+        """
+        with self._collector_lock:
+            c = self._collector
+            self._collector = None
+        if c is None:
+            return None
+        import json as _json
+        duration = time.time() - c["start_t"]
+        rows = c["features"]
+        summary = self._aggregate_collect(rows)
+        summary.update(dict(
+            label=c["label"],
+            duration_s=round(duration, 3),
+            frames=len(rows),
+            sample_rate_hz=50,  # 20ms / 帧 = 50Hz
+            root=c["root"],
+        ))
+        try:
+            with open(os.path.join(c["root"], "summary.json"), "w",
+                      encoding="utf-8") as f:
+                _json.dump(summary, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[COLLECT] 写 summary 失败: {e}", file=sys.stderr)
+        print(f"[COLLECT] 保存完成: "
+              f"label={summary['label']} duration={summary['duration_s']}s "
+              f"frames={summary['frames']} "
+              f"gaze_rate={summary.get('gaze_rate', 0):.2f} "
+              f"lip_rate={summary.get('lip_rate', 0):.2f}")
+        meta = dict(label=summary["label"],
+                    duration_s=summary["duration_s"],
+                    frames=summary["frames"],
+                    root=summary["root"])
+        self._emit("collect_done", **meta)
+        return meta
+
+    def _aggregate_collect(self, rows: list[dict]) -> dict:
+        """把每帧特征聚合成一个小的统计对象（比存全量省几个数量级空间）。
+        字段命名与 auto_tune 所用一致。
+        """
+        n = len(rows)
+        if n == 0:
+            return dict(empty=True)
+        arr = lambda k: np.array([r.get(k, 0.0) for r in rows], dtype=np.float32)
+        rate = lambda k: float(np.mean([1.0 if r.get(k) else 0.0 for r in rows]))
+
+        def stats(vals: np.ndarray) -> dict:
+            if vals.size == 0:
+                return dict(mean=0.0, p15=0.0, p50=0.0, p85=0.0, p90=0.0)
+            return dict(
+                mean=round(float(np.mean(vals)), 3),
+                p15=round(float(np.percentile(vals, 15)), 3),
+                p50=round(float(np.percentile(vals, 50)), 3),
+                p85=round(float(np.percentile(vals, 85)), 3),
+                p90=round(float(np.percentile(vals, 90)), 3),
+            )
+
+        # 只对"有语音"的帧统计语音相关特征，避免静音段拉偏
+        active = [r for r in rows if r.get("voiced") or r.get("is_speech")]
+        active_rms = np.array([r.get("rms", 0.0) for r in active], dtype=np.float32)
+        active_snr = np.array([r.get("snr", 0.0) for r in active], dtype=np.float32)
+        # 面部相关：只在"有脸"的帧统计
+        face_rows = [r for r in rows if r.get("face")]
+        face_area_vals = np.array([r.get("face_area", 0.0) for r in face_rows], dtype=np.float32)
+        lip_std_vals = np.array([r.get("lip_std", 0.0) for r in face_rows], dtype=np.float32)
+
+        # av_sync 帧：voiced 且 lip
+        av_sync_rate = float(np.mean([1.0 if (r.get("voiced") and r.get("lip")) else 0.0
+                                      for r in rows]))
+
+        return dict(
+            # 帧级命中率（权重调参的核心信号）
+            voiced_rate=rate("voiced"),
+            is_speech_rate=rate("is_speech"),
+            face_rate=rate("face"),
+            multi_face_rate=float(np.mean([1.0 if r.get("face_count", 0) >= 2 else 0.0
+                                           for r in rows])),
+            gaze_rate=rate("gaze"),
+            lip_rate=rate("lip"),
+            near_field_audio_rate=rate("near_field_audio"),
+            near_field_visual_rate=rate("near_field_visual"),
+            av_sync_rate=av_sync_rate,
+            # 关键连续量分位数（仅语音/仅有脸段）
+            active_frames=len(active),
+            rms=stats(active_rms),
+            snr=stats(active_snr),
+            face_area=stats(face_area_vals),
+            lip_std=stats(lip_std_vals),
+        )
+
+    def _collect_tick(self, frame_i16: np.ndarray, is_speech: bool, snr: float,
+                       feats: "AudioFeatures", vg: "VisualGates | None"):
+        """在 _loop 每 20ms 调用一次；只有采集器激活时才真正工作。
+        只提取判决所需要的语音+注视+唇动特征，不保留原始波形/图像。
+        """
+        c = self._collector
+        if c is None:
+            return
+        row = dict(
+            is_speech=bool(is_speech),
+            rms=float(feats.rms),
+            voiced=bool(feats.is_voiced),
+            pitch=float(feats.pitch_hz or 0.0),
+            centroid=float(feats.spec_centroid),
+            snr=float(snr),
+            near_field_audio=bool(feats.near_field_ok),
+            doa=float(feats.doa_deg) if feats.doa_deg is not None else None,
+        )
+        if vg is not None and vg.available:
+            row.update(dict(
+                face=bool(vg.face_present),
+                face_count=int(vg.face_count),
+                gaze=bool(vg.gaze_aligned),
+                near_field_visual=bool(vg.near_field),
+                lip=bool(vg.lip_moving),
+                face_area=float(vg.face_area_ratio),
+                face_offset=float(vg.face_center_offset),
+                lip_std=float(vg.lip_motion_std),
+            ))
+        else:
+            row.update(dict(face=False, face_count=0, gaze=False,
+                             near_field_visual=False, lip=False,
+                             face_area=0.0, face_offset=0.0, lip_std=0.0))
+        c["features"].append(row)
 
     # sounddevice 回调（在独立线程）
     def _audio_cb(self, indata, frames, time_info, status):
@@ -384,7 +663,7 @@ class WakeDemo:
                         self._asr_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
                             model=sv_model,
                             tokens=sv_tokens,
-                            num_threads=2,
+                            num_threads=4,   # i5/i7 上 4 线程解码更快
                             use_itn=True,
                             language="zh",
                         )
@@ -440,6 +719,66 @@ class WakeDemo:
         t = threading.Thread(target=_job, daemon=True, name="asr-preload")
         t.start()
 
+    # ---- ASR 前处理：去静音 + RMS 归一化（不做预加重，SenseVoice 对原始波形更鲁棒） ---- #
+    def _prep_asr_audio(self, pcm_i16: np.ndarray) -> np.ndarray:
+        """把送入 ASR 的 int16 PCM 转为 float32，并做两步增强：
+
+        1) VAD 裁剪：按 20ms 帧计算 RMS，动态阈值取 max(静态底, 0.4·中位数)，
+           容忍 ≤ 160ms 的短暂静音（不因换气断句），首尾各保留 250ms padding。
+        2) RMS 归一化到 ≈ -20 dBFS，配合软限幅。
+
+        注：不做 pre-emphasis。SenseVoice 训练数据为原始 16k PCM，预加重会
+        明显降低中文短词识别率（实测"停"/"开灯"等经常被识成空）。
+        """
+        if pcm_i16.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        audio = pcm_i16.astype(np.float32) / 32768.0
+
+        fl = int(0.02 * SAMPLE_RATE)
+        pad = int(0.25 * SAMPLE_RATE)          # 250ms padding
+        n_frames = len(audio) // fl
+        if n_frames >= 20:
+            energies = np.array([
+                np.sqrt(np.mean(audio[i * fl:(i + 1) * fl] ** 2) + 1e-9)
+                for i in range(n_frames)
+            ], dtype=np.float32)
+            static_floor = 0.005                # ≈ -46 dBFS
+            dyn_floor = 0.4 * float(np.median(energies))
+            thr = max(static_floor, dyn_floor)
+            voiced = energies > thr
+            if voiced.any():
+                gap = 0
+                best_s = best_e = -1
+                cur_s = -1
+                best_len = 0
+                for i, v in enumerate(voiced):
+                    if v:
+                        if cur_s < 0:
+                            cur_s = i
+                        gap = 0
+                        cur_e = i
+                        cur_len = cur_e - cur_s + 1
+                        if cur_len > best_len:
+                            best_s, best_e, best_len = cur_s, cur_e, cur_len
+                    else:
+                        gap += 1
+                        if gap > 25:           # 容忍 500ms 换气/停顿，避免长句被切成两段
+                            cur_s = -1
+                            gap = 0
+                if best_s >= 0:
+                    s_smp = max(0, best_s * fl - pad)
+                    e_smp = min(len(audio), (best_e + 1) * fl + pad)
+                    audio = audio[s_smp:e_smp]
+
+        # RMS 归一到 -20 dBFS
+        rms = float(np.sqrt(np.mean(audio ** 2) + 1e-9))
+        if rms > 1e-4:
+            target = 0.10
+            gain = min(5.0, target / rms)
+            audio = audio * gain
+            np.clip(audio, -0.99, 0.99, out=audio)
+        return audio.astype(np.float32)
+
     def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float,
                           wake_count: int | None = None):
         """在后台线程做语音转文字，完成后 emit 'asr' 事件。
@@ -461,11 +800,17 @@ class WakeDemo:
                            error="model_unavailable")
                 return
             try:
-                audio_f = pcm_i16.astype(np.float32) / 32768.0
-                # 峰值归一化，提升低音量下的识别率
-                peak = float(np.max(np.abs(audio_f))) if audio_f.size else 0.0
-                if 0 < peak < 0.5:
-                    audio_f = audio_f * min(3.0, 0.8 / peak)
+                # 统一的 ASR 前处理：裁掉静音段 + 预加重 + RMS 归一化
+                audio_f = self._prep_asr_audio(pcm_i16)
+                if audio_f.size < int(0.2 * SAMPLE_RATE):
+                    # 语音段过短（<200ms），直接判为无效
+                    self._reject_wake(wake_count_snapshot)
+                    self._emit("asr", word=name, score=score, text="",
+                               count=wake_count_snapshot,
+                               rejected=True,
+                               reject_reason="语音段过短（<200ms）",
+                               backend=backend)
+                    return
 
                 if backend == "sensevoice":
                     s = model.create_stream()
@@ -482,8 +827,10 @@ class WakeDemo:
                         temperature=[0.0, 0.2, 0.4],
                         vad_filter=False,
                         condition_on_previous_text=False,
-                        no_speech_threshold=0.45,
-                        initial_prompt="以下是用户对智能助手的中文指令。",
+                        no_speech_threshold=0.5,
+                        log_prob_threshold=-1.0,
+                        compression_ratio_threshold=2.4,
+                        initial_prompt="以下是用户对智能助手的中文指令，请用简体中文转写。",
                     )
                     text = "".join(seg.text for seg in segments).strip()
                     lang_detected = getattr(info, "language", None)
@@ -499,6 +846,11 @@ class WakeDemo:
                            count=wake_count_snapshot, backend=backend,
                            rejected=rejected, reject_reason=reject_reason,
                            language=lang_detected)
+                # ASR 成功完成后立即回到 IDLE，避免等待 8s LISTENING 超时
+                # 导致"一次识别后要间隔几秒才能再次识别"。
+                if not rejected and self.state == "LISTENING":
+                    self.state = "IDLE"
+                    self._emit("state", state=self.state, reason="asr_done")
             except Exception as e:
                 print(f"[ASR] 转写失败: {e}", file=sys.stderr)
                 self._reject_wake(wake_count_snapshot)
@@ -521,11 +873,11 @@ class WakeDemo:
             self._emit("state", state=self.state, reason="asr_rejected")
 
     def _on_wake(self, name: str, score: float):
-        """唪醒命中。立即 emit wake 事件；ASR 延迟 POSTROLL 秒再启动，
-        等到环形缓冲把唪醒之后的语音一起录完，保证句尾完整。"""
+        """唪醒命中。立即 emit wake 事件；随后对尾部做 endpointing，
+        一旦检测到说完（末尾连续静音 ≥ ENDPOINT_SILENCE_MS）立刻送 ASR，
+        最多等 POSTROLL_SECONDS。"""
         self.wake_count += 1
-        print(f">>> WAKE #{self.wake_count}! word={name} score={score:.2f} "
-              f"| 等待 {POSTROLL_SECONDS:.1f}s postroll 后送 ASR")
+        print(f">>> WAKE #{self.wake_count}  {name} {score:.2f}")
         self._emit("wake", word=name, score=score,
                    duration=REPLAY_SECONDS + POSTROLL_SECONDS,
                    count=self.wake_count)
@@ -533,10 +885,47 @@ class WakeDemo:
         wake_count_snapshot = self.wake_count
 
         def _delayed():
-            time.sleep(POSTROLL_SECONDS)
-            history = self.ring.read_last(REPLAY_SECONDS + POSTROLL_SECONDS)
-            dur = len(history) / SAMPLE_RATE
-            print(f"[ASR ] 取 {dur:.2f}s 音频送转写")
+            # 尾点检测：每 50ms 轮询末尾 300ms 音频的 RMS，统计连续静音时长
+            fl = int(0.02 * SAMPLE_RATE)        # 20ms
+            sil_floor = max(80.0, self.noise.noise_rms * 2.5)  # 小声说话也不被误切
+            min_wait = ENDPOINT_MIN_WAIT_MS / 1000.0
+            max_wait = POSTROLL_SECONDS
+            sil_need = ENDPOINT_SILENCE_MS / 1000.0
+            t0 = time.time()
+            sil_run = 0.0
+            while True:
+                time.sleep(0.05)
+                elapsed = time.time() - t0
+                if elapsed >= max_wait:
+                    reason = "timeout"
+                    break
+                if elapsed < min_wait:
+                    continue
+                tail = self.ring.read_last(0.20)  # 最近 200ms
+                if tail.size < fl:
+                    continue
+                # 末段 RMS（int16 域）
+                tail_f = tail.astype(np.float32)
+                rms_tail = float(np.sqrt(np.mean(tail_f * tail_f) + 1e-6))
+                if rms_tail < sil_floor:
+                    sil_run += 0.05
+                    if sil_run >= sil_need:
+                        reason = "endpoint"
+                        break
+                else:
+                    sil_run = 0.0
+
+            history_seconds = REPLAY_SECONDS + (time.time() - t0) + 0.3  # 多留 300ms 裕量
+            history = self.ring.read_last(
+                history_seconds,
+                max_samples=max(0, self.ring.snapshot_total() - self._last_asr_end_sample),
+            )
+            # 记录本次读取的结束位置，避免下次唤醒又把这段音频当成"上一句"重复识别
+            self._last_asr_end_sample = self.ring.snapshot_total()
+            waited_ms = int((time.time() - t0) * 1000)
+            if getattr(self.args, "verbose", False):
+                dur = len(history) / SAMPLE_RATE
+                print(f"[ASR ] endpoint={reason} wait={waited_ms}ms audio={dur:.2f}s")
             self._transcribe_async(history.copy(), name, score,
                                    wake_count=wake_count_snapshot)
 
@@ -616,10 +1005,22 @@ class WakeDemo:
             frame, ref = item
             if len(frame) != VAD_FRAME_LEN:
                 continue
+
+            # 环形缓冲保存"原始"音频——ASR 直接从 ring 读，避免 3A 的 ANS/AGC
+            # 污染模型输入。3A 处理只用于下游 VAD/特征/门限判决。
             self.ring.write(frame)
+
+            # 3A 预处理（仅影响 VAD/特征，不影响 ASR 输入）：
+            # 使用上一帧的 is_speech 作为噪声估计 hint，避免讲话时更新噪声模型。
+            if self.audio_3a is not None:
+                frame = self.audio_3a.process(
+                    frame, ref_i16=ref,
+                    is_speech_hint=bool(getattr(self, "_prev_is_speech", False)),
+                )
 
             # 轻量 VAD（做状态保留/超时）
             is_speech = self.vad.is_speech(frame)
+            self._prev_is_speech = is_speech
 
             # 噪声底/SNR
             rms = NoiseTracker.rms(frame)
@@ -628,6 +1029,12 @@ class WakeDemo:
 
             # 增强音频特征（HPF、浊音、频谱重心、DOA、近场）
             feats = self.audio_fe.process(frame, ref)
+
+            # 如果采集器开启：无论当前模式是否是 multimodal，都抓一次视觉快照
+            # （采集始终记录音视频+特征，方便后续 auto_tune）
+            if self._collector is not None:
+                vg_snap = self.visual.snapshot() if self.visual is not None else None
+                self._collect_tick(frame, is_speech, snr, feats, vg_snap)
 
             # LISTENING 超时
             if self.state == "LISTENING" and time.time() - self.listen_start > LISTEN_TIMEOUT_S:
@@ -678,7 +1085,6 @@ class WakeDemo:
             if self.state == "IDLE":
                 self._fire_wake(best_name, float(best_score))
             else:
-                print(f"[INFO] LISTENING 中再次触发 ({best_name}={best_score:.2f})")
                 self._emit("interrupt_hint", word=best_name, score=float(best_score))
 
     # -------- 模式 C：多模态硬门限路径（方案 §5.2 路径 B 正式实现） -------- #
@@ -691,13 +1097,13 @@ class WakeDemo:
         噪声评估只用"voiced 且 用户无唇动"的帧（近似视为外部人声），
         从而把用户本人的当前语音排除在外。同时把嘈杂阈值抬高。
 
-        判定规则：
+        判定规则（灵敏度偏好：更容易进入 relaxed）：
         1) 噪声：
-           - quiet:  noise_rms 2s 均值 < 250 且 other_voice_ratio < 0.15
-           - noisy:  noise_rms > 700 或 other_voice_ratio > 0.55
+           - quiet:  noise_rms 2s 均值 < 400 且 other_voice_ratio < 0.25
+           - noisy:  noise_rms > 900 或 other_voice_ratio > 0.60
            - normal: 其他
         2) 人数：
-           - single: 近 1s 内 face_count == 1 的帧占比 ≥ 70%
+           - single: 近 1s 内 face_count == 1 的帧占比 ≥ 55%
            - multi:  同窗口 face_count ≥ 2 的帧占比 ≥ 30%
            - none:   无脸
         3) profile 合成：
@@ -731,9 +1137,9 @@ class WakeDemo:
         single_ratio = float(np.mean(face_arr == 1))
         multi_ratio = float(np.mean(face_arr >= 2))
 
-        if noise_mean < 250.0 and other_voice_ratio < 0.15:
+        if noise_mean < 400.0 and other_voice_ratio < 0.25:
             noise_label = "quiet"
-        elif noise_mean > 700.0 or other_voice_ratio > 0.55:
+        elif noise_mean > 900.0 or other_voice_ratio > 0.60:
             noise_label = "noisy"
         else:
             noise_label = "normal"
@@ -742,7 +1148,7 @@ class WakeDemo:
             crowd_label = "none"
         elif multi_ratio >= 0.30:
             crowd_label = "multi"
-        elif single_ratio >= 0.70:
+        elif single_ratio >= 0.55:
             crowd_label = "single"
         else:
             crowd_label = "none"
@@ -784,10 +1190,10 @@ class WakeDemo:
         # 浊音 hangover：每次出现浊音后保留 N 帧"近期浊音"状态，抗短暂停顿
         # 灵敏度调整：内部门限更宽松（SNR 1.0 而不是 3.0），hangover 加长到 400ms，
         # 长静音清零门限放宽到 900ms，避免自然说话停顿把累计置零。
-        if feats.is_voiced and snr >= 1.0:
+        if feats.is_voiced and snr >= 0.5:
             self.speech_run_ms += VAD_FRAME_MS
             self.silence_run_ms = 0.0
-            self._voiced_hangover = 20  # 20*20ms = 400ms 尾拖
+            self._voiced_hangover = 25  # 25*20ms = 500ms 尾拖
         else:
             if getattr(self, "_voiced_hangover", 0) > 0:
                 # hangover 内仍推进 speech_run（按 0.75 速率，尽量保留语流）
@@ -838,9 +1244,9 @@ class WakeDemo:
             lip_cnt = sum(1 for _, l in self._av_window if l)
             voiced_only = sum(1 for v, l in self._av_window if v and not l)  # 有声无唇 ≈ 同事语音
             av_sync_ok = (
-                voiced_cnt >= 4 and lip_cnt >= 4
-                and coincide >= max(3, int(0.40 * voiced_cnt))
-                and voiced_only <= int(1.5 * coincide) + 1  # 反证帧放宽，允许短暂嘴型遮挡
+                voiced_cnt >= 3 and lip_cnt >= 3
+                and coincide >= max(2, int(0.35 * voiced_cnt))
+                and voiced_only <= int(1.8 * coincide) + 2  # 反证帧放宽，允许短暂嘴型遮挡
             )
         else:
             av_sync_ok = False
@@ -869,38 +1275,19 @@ class WakeDemo:
         # ===== 环境画像：根据噪声/人数选择宽/严策略（方案"添加权重"） ===== #
         profile, env_snap = self._update_env_profile(vg, voiced_now, snr)
 
-        # 每个 profile 定义：必需门 + 可选门(权重) + 可选分阈值 + SUSTAIN + debounce
-        # 必需门全 True 才视为"基线满足"；可选门的加权和 ≥ 阈值才视为"证据充分"
-        # 总原则：越嘈杂/越多人，把更多门变为必需 + 抬高 gaze 等权重，越安静单人越放宽
-        if profile == "relaxed":
-            # 安静 + 单人：只要有"部分朝向 + 清晰语句"即可
-            # 必需：voiced、speech_run、face（看见人）
-            # 可选加分：gaze(0.9)、lip(0.8)、near_field(0.7)、av_sync(0.6)、snr(0.5)、doa(0.3)
-            required = ["voiced", "speech_run", "face"]
-            weights = {"gaze": 0.9, "lip": 0.8, "near_field": 0.7,
-                       "av_sync": 0.6, "snr": 0.5, "doa": 0.3}
-            optional_thresh = 1.4    # ~= 两项通过（如 gaze+near 或 lip+snr）
-            sustain_frames = 3       # 60ms
-            debounce_s = 1.0
-        elif profile == "strict":
-            # 嘈杂 / 多人：全部硬门限 + 抬高 gaze 权重（注视权重 ×1.8）
-            required = ["voiced", "snr", "speech_run", "face", "gaze",
-                        "lip", "near_field", "av_sync"]
-            weights = {"gaze": 1.8, "doa": 1.2, "av_sync": 1.2}
-            optional_thresh = 0.0    # 所有必需门已覆盖，权重仅影响持续帧数
-            sustain_frames = 7       # 140ms，更严
-            debounce_s = 2.0
+        # 每个 profile 的权重表：默认值 + 可被 auto_tune 配置覆盖。
+        # 配置来源: self._tuned_cfg['profiles'][profile]，若不存在则用内置默认。
+        prof_cfg = self._resolve_profile_cfg(profile)
+        required = list(prof_cfg["required"])
+        weights = dict(prof_cfg["weights"])
+        optional_thresh = float(prof_cfg["optional_thresh"])
+        sustain_frames = int(prof_cfg["sustain_frames"])
+        debounce_s = float(prof_cfg["debounce_s"])
+
+        if profile == "strict":
             # SNR 在 strict 下再抬高 2dB，对应方案 §5.3 的嘈杂抬阈
             min_snr_eff = min_snr_db + 2.0
             gates["snr"] = snr >= min_snr_eff
-        else:
-            # normal：当前策略（全部硬门限 AND）
-            required = ["voiced", "snr", "speech_run", "face", "gaze",
-                        "lip", "near_field", "av_sync"]
-            weights = {}
-            optional_thresh = 0.0
-            sustain_frames = 5       # 100ms
-            debounce_s = 1.5
 
         # 必需门是否全通过
         required_ok = all(gates.get(k, False) for k in required)
@@ -944,8 +1331,8 @@ class WakeDemo:
                 reason = (f"ok({profile})" if sustained
                           else f"veto:{','.join(failed)}({profile})")
 
-        # 诊断：当有浊音时每 1.5s 打印一次门限状态，帮助定位哪个门在挡
-        if is_speech:
+        # 诊断：仅 --verbose 时才打印门限状态（常规运行不再刷屏）
+        if is_speech and getattr(self.args, "verbose", False):
             last_diag = getattr(self, "_last_diag_t", 0.0)
             if now - last_diag > 1.5:
                 self._last_diag_t = now
@@ -1065,11 +1452,11 @@ def parse_args():
     )
     p.add_argument("--base-thresh", type=float, default=0.5,
                    help="[kws] KWS 基础阈值 / [vad] 证据强度基础门限")
-    p.add_argument("--min-speech-ms", type=float, default=300.0,
+    p.add_argument("--min-speech-ms", type=float, default=200.0,
                    help="[vad/multimodal] 触发所需的最小连续语音时长(ms)")
-    p.add_argument("--min-snr-db", type=float, default=6.0,
+    p.add_argument("--min-snr-db", type=float, default=3.0,
                    help="[vad/multimodal] 触发所需的最小 SNR(dB)")
-    p.add_argument("--near-field-rms", type=float, default=500.0,
+    p.add_argument("--near-field-rms", type=float, default=350.0,
                    help="[multimodal] 音频近场 RMS 绝对门限（同事远场一般 <300）")
     p.add_argument("--audio-channels", type=int, default=2,
                    help="[multimodal] 音频通道数，≥2 时启用 GCC-PHAT DOA")
@@ -1080,6 +1467,10 @@ def parse_args():
     p.add_argument("--no-strict-multimodal", action="store_true",
                    help="[multimodal] 若视觉不可用，允许退化为纯音频严格模式")
     p.add_argument("--no-vad-gate", action="store_true", help="[kws] 关闭 VAD 门控（调试）")
+    p.add_argument("--no-3a", action="store_true",
+                   help="关闭 3A 预处理(HPF+ANS+AGC)，用于对比/排查")
+    p.add_argument("--apm-strength", type=float, default=0.3,
+                   help="ANS 过滤强度 0~1，默认 0.3（值大 = 压噪更狠，但可能剥剥声），0 等同关闭 ANS")
     p.add_argument("--asr-model", type=str, default="tiny",
                    help="faster-whisper 模型: tiny/base/small/medium/large-v3 (默认 tiny)")
     p.add_argument("--verbose", action="store_true", help="打印所有分数")
