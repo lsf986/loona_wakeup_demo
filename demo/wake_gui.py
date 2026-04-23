@@ -3,7 +3,7 @@ Loona 唤醒模块 Demo - Tkinter GUI
 =================================
 
 在 wake_demo.py 的核心引擎上封装一个可视化界面：
-- 选择麦克风设备、触发模式（multimodal/vad/kws）、唤醒词、基础阈值
+- 选择麦克风设备、触发模式（multimodal/vad）、基础阈值
 - 开始/停止监听
 - 实时显示 KWS 分数 / 动态阈值 / SNR / VAD / 状态
 - 多模态模式下显示：注视/唇动/DOA/近场四硬门限状态灯 + 摄像头预览
@@ -38,15 +38,37 @@ try:
 except ImportError:
     HAVE_PREVIEW = False
 
-AVAILABLE_WAKEWORDS = ["hey_jarvis", "alexa", "hey_mycroft", "hey_rhasspy", "timer", "weather"]
+
+# ======================= 深色扁平主题色板 ======================= #
+THEME = {
+    "bg":          "#0a0a0a",  # 根背景（纯黑）
+    "panel":       "#111111",  # 卡片背景（与根几乎一致，去边界感）
+    "panel_alt":   "#1a1a1a",  # 二级卡片 / 控件底
+    "border":      "#111111",  # 边框（与面板同色 = 视觉无边框）
+    "divider":     "#222222",  # 仅用于极细分割线
+    "fg":          "#e6edf3",  # 主文字（冷白）
+    "fg_dim":      "#8b949e",  # 次要文字
+    "fg_mute":     "#5a6472",  # 灰度 / 关闭态
+    "accent":      "#00d4ff",  # 主青蓝高亮（科技感）
+    "accent_dark": "#0891b2",  #
+    "ok":          "#00ff9c",  # 通过 / LISTENING
+    "warn":        "#ffb454",  # 警告 / 黄
+    "bad":         "#ff4d6d",  # 失败 / 唤醒红
+    "pending":     "#ffb454",
+    "reject":      "#ff6b81",
+    "font_ui":     ("Segoe UI", 9),
+    "font_mono":   ("JetBrains Mono", 9),  # 若没有会回退
+    "font_asr":    ("Microsoft YaHei UI", 10),
+}
 
 
 class WakeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Loona 唤醒模块 Demo")
+        self.title("◆ LOONA  ·  Wake Module")
         self.geometry("1080x640")
         self.minsize(960, 560)
+        self.configure(bg=THEME["bg"])
 
         self.engine: WakeDemo | None = None
         self.engine_thread: threading.Thread | None = None
@@ -54,26 +76,232 @@ class WakeGUI(tk.Tk):
         self._last_gates = {}
         self._preview_photo = None  # 防止被 GC
 
+        self._apply_theme()
+        # 先隐藏窗口再构建 UI + 设置深色标题栏，最后再 deiconify 显示，
+        # 避免 DWM 先用默认浅色主题绘制一次非客户区，造成"白闪一下才变黑"
+        try:
+            self.withdraw()
+        except Exception:
+            pass
         self._build_ui()
+        self._enable_dark_titlebar()
         self._refresh_devices()
+        # 显示窗口，并做一次 1px 的尺寸扰动，强制 DWM 重新合成非客户区
+        try:
+            self.update_idletasks()
+            self.deiconify()
+            self._nudge_titlebar_repaint()
+        except Exception:
+            pass
         self.after(80, self._drain_events)
         self.after(100, self._refresh_preview)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ------------------------ 主题 ------------------------ #
+    def _enable_dark_titlebar(self):
+        """Windows 10/11: 通过 DWM 把系统标题栏染成深色。
+
+        必须在窗口首次显示前调用，否则 DWM 已用默认浅色绘制非客户区，
+        需要额外触发重绘才能生效（见 `_nudge_titlebar_repaint`）。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1)
+            # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+); 19 为旧版
+            for attr in (20, 19):
+                res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    wintypes.HWND(hwnd), wintypes.DWORD(attr),
+                    ctypes.byref(value), ctypes.sizeof(value))
+                if res == 0:
+                    break
+        except Exception:
+            pass
+
+    def _nudge_titlebar_repaint(self):
+        """对已显示的窗口做 1px 尺寸扰动，强制 DWM 重新绘制非客户区。
+
+        某些 Windows 版本在设置 DWMWA_USE_IMMERSIVE_DARK_MODE 之后，
+        只有窗口尺寸/状态发生变化时，标题栏颜色才会立即刷新。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            geo = self.geometry()  # "WxH+X+Y"
+            import re
+            m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geo)
+            if not m:
+                return
+            w, h, x, y = (int(g) for g in m.groups())
+            self.geometry(f"{w+1}x{h}+{x}+{y}")
+            self.update_idletasks()
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _apply_theme(self):
+        """全局深色科技主题，基于 ttk 的 clam 样式做覆盖。"""
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        T = THEME
+        # 根 / 普通容器
+        style.configure(".",
+                        background=T["bg"], foreground=T["fg"],
+                        fieldbackground=T["panel_alt"],
+                        borderwidth=0, font=T["font_ui"])
+        style.configure("TFrame", background=T["panel"])
+        style.configure("TLabel", background=T["panel"], foreground=T["fg"])
+        style.configure("Root.TFrame", background=T["bg"])
+        style.configure("TCheckbutton", background=T["panel"], foreground=T["fg"],
+                        focuscolor=T["accent"])
+        style.map("TCheckbutton",
+                  background=[("active", T["panel"])],
+                  foreground=[("disabled", T["fg_mute"])])
+        style.configure("TRadiobutton", background=T["panel"], foreground=T["fg"])
+        style.map("TRadiobutton",
+                  background=[("active", T["panel"])],
+                  foreground=[("selected", T["accent"]),
+                              ("disabled", T["fg_mute"])])
+
+        # 卡片（LabelFrame）：扁平无边框，仅用小标题
+        style.configure("TLabelframe",
+                        background=T["panel"],
+                        bordercolor=T["panel"],
+                        lightcolor=T["panel"], darkcolor=T["panel"],
+                        relief="flat", borderwidth=0)
+        style.configure("TLabelframe.Label",
+                        background=T["panel"], foreground=T["accent"],
+                        font=("Segoe UI", 9, "bold"))
+
+        # 按钮：纯扁平
+        style.configure("TButton",
+                        background=T["panel_alt"], foreground=T["fg"],
+                        bordercolor=T["panel_alt"], lightcolor=T["panel_alt"],
+                        darkcolor=T["panel_alt"], focuscolor=T["panel_alt"],
+                        relief="flat", borderwidth=0, padding=(10, 5))
+        style.map("TButton",
+                  background=[("active", T["accent_dark"]),
+                              ("pressed", T["accent_dark"]),
+                              ("disabled", T["panel"])],
+                  foreground=[("active", "#ffffff"),
+                              ("disabled", T["fg_mute"])],
+                  bordercolor=[("active", T["accent_dark"]),
+                               ("focus", T["accent_dark"])])
+
+        # 下拉框 / 输入（扁平无边框）
+        style.configure("TCombobox",
+                        fieldbackground=T["panel_alt"], background=T["panel_alt"],
+                        foreground=T["fg"], bordercolor=T["panel_alt"],
+                        arrowcolor=T["accent"], lightcolor=T["panel_alt"],
+                        darkcolor=T["panel_alt"], selectbackground=T["accent_dark"],
+                        selectforeground="#ffffff", relief="flat", borderwidth=0)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", T["panel_alt"])],
+                  foreground=[("readonly", T["fg"])],
+                  bordercolor=[("focus", T["accent"])])
+        self.option_add("*TCombobox*Listbox.background", T["panel_alt"])
+        self.option_add("*TCombobox*Listbox.foreground", T["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", T["accent_dark"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+        style.configure("TSpinbox",
+                        fieldbackground=T["panel_alt"], foreground=T["fg"],
+                        bordercolor=T["panel_alt"], arrowcolor=T["accent"],
+                        lightcolor=T["panel_alt"], darkcolor=T["panel_alt"],
+                        insertcolor=T["accent"], relief="flat", borderwidth=0)
+        style.map("TSpinbox", bordercolor=[("focus", T["accent"])])
+
+        # 进度条：扁平发光
+        style.configure("Horizontal.TProgressbar",
+                        troughcolor=T["panel_alt"],
+                        background=T["accent"],
+                        bordercolor=T["panel_alt"],
+                        lightcolor=T["accent"], darkcolor=T["accent"],
+                        borderwidth=0, thickness=6)
+
+        # 滑块
+        style.configure("Horizontal.TScale",
+                        background=T["bg"], troughcolor=T["panel_alt"],
+                        bordercolor=T["panel_alt"],
+                        lightcolor=T["accent"], darkcolor=T["accent_dark"],
+                        borderwidth=0)
+        style.map("Horizontal.TScale",
+                  background=[("active", T["accent"])])
+
+        # PanedWindow 分隔（极细深色条）
+        style.configure("TPanedwindow", background=T["bg"])
+        style.configure("Sash", sashthickness=2, background=T["divider"],
+                        bordercolor=T["bg"], lightcolor=T["bg"], darkcolor=T["bg"])
+
+        # 滚动条：深色扁平
+        style.configure("Dark.Vertical.TScrollbar",
+                        background=T["panel_alt"], troughcolor=T["panel"],
+                        bordercolor=T["panel"], arrowcolor=T["fg_dim"],
+                        lightcolor=T["panel_alt"], darkcolor=T["panel_alt"],
+                        relief="flat", borderwidth=0, arrowsize=12)
+        style.map("Dark.Vertical.TScrollbar",
+                  background=[("active", T["accent_dark"]),
+                              ("pressed", T["accent_dark"])],
+                  arrowcolor=[("active", T["accent"])])
+        style.configure("Dark.Horizontal.TScrollbar",
+                        background=T["panel_alt"], troughcolor=T["panel"],
+                        bordercolor=T["panel"], arrowcolor=T["fg_dim"],
+                        lightcolor=T["panel_alt"], darkcolor=T["panel_alt"],
+                        relief="flat", borderwidth=0, arrowsize=12)
+        style.map("Dark.Horizontal.TScrollbar",
+                  background=[("active", T["accent_dark"]),
+                              ("pressed", T["accent_dark"])],
+                  arrowcolor=[("active", T["accent"])])
+        # 同时覆盖默认 scrollbar（ScrolledText 使用 tk.Scrollbar，无法应用 ttk 样式，
+        # 交由 _style_text 里 dark_scrollbar 处理）
+
+    def _style_text(self, widget: tk.Text):
+        """把 tk.Text / ScrolledText 改成深色外观（全扁平、无边框，配深色滚动条）。"""
+        T = THEME
+        widget.configure(
+            background=T["panel_alt"], foreground=T["fg"],
+            insertbackground=T["accent"],
+            selectbackground=T["accent_dark"], selectforeground="#ffffff",
+            borderwidth=0, highlightthickness=0, relief="flat",
+            padx=6, pady=4,
+        )
+        # ScrolledText 自带 tk.Scrollbar(widget.vbar)：手动染色
+        sb = getattr(widget, "vbar", None)
+        if sb is not None:
+            try:
+                sb.configure(
+                    background=T["panel_alt"], troughcolor=T["panel"],
+                    activebackground=T["accent_dark"],
+                    highlightbackground=T["panel"], highlightcolor=T["panel"],
+                    borderwidth=0, relief="flat", width=10,
+                    elementborderwidth=0,
+                )
+            except tk.TclError:
+                pass
+
+
     # ------------------------ UI ------------------------ #
     def _build_ui(self):
         pad = {"padx": 4, "pady": 2}
-        small = ("Segoe UI", 9)
+        small = THEME["font_ui"]
+        mono = THEME["font_mono"]
 
         # ============ 上部：左(参数+实时监测) + 右(控制栏+摄像头) ============
-        upper = ttk.Frame(self)
-        upper.pack(fill="both", expand=False, padx=6, pady=(4, 2))
+        upper = ttk.Frame(self, style="Root.TFrame")
+        upper.pack(fill="both", expand=False, padx=6, pady=(6, 2))
         upper.columnconfigure(0, weight=0, minsize=520)
         upper.columnconfigure(1, weight=1, minsize=280)
 
-        # ------- 左列：参数 -------
-        top = ttk.LabelFrame(upper, text="参数")
-        top.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        # ------- 左列：参数（已隐藏，仅保留变量供引擎使用） -------
+        top = ttk.Frame(upper)
+        # 不 grid 到界面 → 参数栏不显示
 
         # 行 0：设备 + 基础阈值
         ttk.Label(top, text="设备:", font=small).grid(row=0, column=0, sticky="e", **pad)
@@ -99,20 +327,12 @@ class WakeGUI(tk.Tk):
                         value="multimodal", command=self._on_mode_change).pack(side="left")
         ttk.Radiobutton(mode_frame, text="VAD", variable=self.var_mode,
                         value="vad", command=self._on_mode_change).pack(side="left", padx=6)
-        ttk.Radiobutton(mode_frame, text="KWS", variable=self.var_mode,
-                        value="kws", command=self._on_mode_change).pack(side="left")
         self.var_no_vad = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="关VAD门控",
                         variable=self.var_no_vad).pack(side="left", padx=10)
         self.var_tts = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="模拟TTS",
                         variable=self.var_tts, command=self._on_tts_toggle).pack(side="left")
-
-        # 唤醒词（隐藏 UI，仍保留变量用于 KWS 模式启动）
-        self.cmb_wake = ttk.Combobox(self, values=AVAILABLE_WAKEWORDS,
-                                     state="readonly", width=14)
-        self.cmb_wake.set("hey_jarvis")
-        # 不 pack/grid 到窗口 → 不显示
 
         # 行 2：VAD 子参数
         self.vad_frame = ttk.Frame(top)
@@ -127,12 +347,6 @@ class WakeGUI(tk.Tk):
         ttk.Spinbox(self.vad_frame, from_=0.0, to=25.0, increment=0.5,
                     textvariable=self.var_min_snr, width=5, font=small,
                     format="%.1f").pack(side="left", padx=2)
-
-        # KWS 子面板（与 vad_frame 共用一行）
-        self.kws_frame = ttk.Frame(top)
-        self.kws_frame.grid(row=3, column=0, columnspan=7, sticky="we", **pad)
-        ttk.Label(self.kws_frame, text="(KWS 模式使用默认唤醒词 hey_jarvis)",
-                  font=small, foreground="#888").pack(side="left")
 
         # 行 4：多模态专属参数
         self.mm_frame = ttk.Frame(top)
@@ -165,12 +379,12 @@ class WakeGUI(tk.Tk):
         top.columnconfigure(2, weight=1)
         self._update_mode_panels()
 
-        # ------- 右列：控制栏 + 摄像头预览 -------
-        right = ttk.Frame(upper)
+        # ------- 右列：摄像头预览 -------
+        right = ttk.Frame(upper, style="Root.TFrame")
         right.grid(row=0, column=1, rowspan=2, sticky="nsew")
 
-        ctrl = ttk.LabelFrame(right, text="控制")
-        ctrl.pack(fill="x", pady=(0, 2))
+        # 控制栏（移到左侧 mon 下方）
+        ctrl = ttk.LabelFrame(upper, text="控制")
         ctrl_row = ttk.Frame(ctrl)
         ctrl_row.pack(fill="x", padx=4, pady=2)
         self.btn_start = ttk.Button(ctrl_row, text="▶ 开始", command=self.start_engine, width=8)
@@ -178,30 +392,39 @@ class WakeGUI(tk.Tk):
         self.btn_stop = ttk.Button(ctrl_row, text="■ 停止", command=self.stop_engine,
                                    width=7, state="disabled")
         self.btn_stop.pack(side="left", padx=2)
-        self.lbl_state = ttk.Label(ctrl_row, text="● IDLE", foreground="gray",
-                                   font=("Consolas", 9, "bold"))
+        self.lbl_state = ttk.Label(ctrl_row, text="● IDLE", foreground=THEME["fg_mute"],
+                                   background=THEME["panel"],
+                                   font=(mono[0], 10, "bold"))
         self.lbl_state.pack(side="left", padx=6)
 
-        count_row = ttk.Frame(ctrl)
-        count_row.pack(fill="x", padx=4, pady=(0, 2))
-        ttk.Label(count_row, text="唤醒次数:", font=small).pack(side="left")
-        self.wake_count = 0
-        self.lbl_wake_count = ttk.Label(count_row, text="0", foreground="#d62828",
-                                        font=("Consolas", 13, "bold"), width=4)
-        self.lbl_wake_count.pack(side="left", padx=2)
-        self.btn_reset_count = ttk.Button(count_row, text="清零", width=5,
+        # 右侧：唤醒次数 + 清零（右对齐）
+        self.btn_reset_count = ttk.Button(ctrl_row, text="清零", width=5,
                                           command=self._reset_wake_count)
-        self.btn_reset_count.pack(side="left", padx=2)
+        self.btn_reset_count.pack(side="right", padx=(14, 2))
+        self.wake_count = 0
+        self.lbl_wake_count = ttk.Label(ctrl_row, text="0", foreground=THEME["bad"],
+                                        background=THEME["panel"],
+                                        font=(mono[0], 15, "bold"),
+                                        anchor="w")
+        self.lbl_wake_count.pack(side="right", padx=(2, 0))
+        ttk.Label(ctrl_row, text="唤醒次数", font=small,
+                  background=THEME["panel"], foreground=THEME["fg_dim"]
+                  ).pack(side="right", padx=(10, 0))
 
         cam_frame = ttk.LabelFrame(right, text="摄像头预览")
         cam_frame.pack(fill="both", expand=True)
-        self.lbl_preview = ttk.Label(cam_frame, text="(未启动)", font=small,
-                                     width=30, anchor="center")
+        # 预览 Label 用 tk.Label 以便自定义深色背景
+        self.lbl_preview = tk.Label(cam_frame, text="◇  STAND BY", font=(mono[0], 10),
+                                    width=30, anchor="center", bd=0,
+                                    highlightthickness=0,
+                                    bg=THEME["panel_alt"], fg=THEME["fg_mute"])
         self.lbl_preview.pack(fill="both", expand=True, padx=2, pady=2)
 
         # ============ 左列：实时监测（紧凑） ============
         mon = ttk.LabelFrame(upper, text="实时监测")
-        mon.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(2, 0))
+        mon.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 2))
+        ctrl.grid(row=1, column=0, sticky="we", padx=(0, 4), pady=(0, 0))
+        upper.rowconfigure(0, weight=1)
         upper.rowconfigure(1, weight=0)
 
         self._add_bar(mon, "KWS 分数", "score", 0)
@@ -222,7 +445,8 @@ class WakeGUI(tk.Tk):
 
         self.lbl_audio_diag = ttk.Label(mon,
             text="RMS=---  centroid=---Hz  pitch=---Hz  DOA=---",
-            font=("Consolas", 8), foreground="#555")
+            font=(mono[0], 8), foreground=THEME["fg_dim"],
+            background=THEME["panel"])
         self.lbl_audio_diag.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
         mon.columnconfigure(1, weight=1)
 
@@ -238,8 +462,9 @@ class WakeGUI(tk.Tk):
         }
         for i, (k, label) in enumerate(self.gate_names.items()):
             lbl = ttk.Label(gates_frame, text=f"○ {label}", width=10,
-                            font=small, foreground="#888")
-            lbl.grid(row=0, column=i, padx=3, pady=2)
+                            font=small, foreground=THEME["fg_mute"],
+                            background=THEME["panel"])
+            lbl.grid(row=0, column=i, padx=3, pady=4)
             self.gate_labels[k] = lbl
 
         # ============ 底部：日志 + ASR ============
@@ -247,33 +472,37 @@ class WakeGUI(tk.Tk):
         bot.pack(fill="both", expand=True, padx=6, pady=(2, 4))
 
         log_frame = ttk.LabelFrame(bot, text="事件日志")
-        self.txt_log = scrolledtext.ScrolledText(log_frame, height=6, font=("Consolas", 8))
+        self.txt_log = scrolledtext.ScrolledText(log_frame, height=6, font=(mono[0], 9))
         self.txt_log.pack(fill="both", expand=True)
-        self.txt_log.tag_config("wake", foreground="#d62828", font=("Consolas", 8, "bold"))
-        self.txt_log.tag_config("info", foreground="#444")
-        self.txt_log.tag_config("warn", foreground="#b58105")
+        self._style_text(self.txt_log)
+        self.txt_log.tag_config("wake", foreground=THEME["bad"], font=(mono[0], 9, "bold"))
+        self.txt_log.tag_config("info", foreground=THEME["fg_dim"])
+        self.txt_log.tag_config("warn", foreground=THEME["warn"])
         bot.add(log_frame, weight=3)
 
         asr_frame = ttk.LabelFrame(bot, text="ASR 转写结果")
         self.txt_asr = scrolledtext.ScrolledText(asr_frame, height=6,
-                                                 font=("Microsoft YaHei", 9), wrap="word")
+                                                 font=THEME["font_asr"], wrap="word")
         self.txt_asr.pack(fill="both", expand=True)
-        self.txt_asr.tag_config("idx", foreground="#888", font=("Consolas", 8))
-        self.txt_asr.tag_config("text", foreground="#111",
-                                font=("Microsoft YaHei", 10, "bold"))
-        self.txt_asr.tag_config("meta", foreground="#666", font=("Consolas", 7))
-        self.txt_asr.tag_config("pending", foreground="#b58105",
-                                font=("Microsoft YaHei", 9, "italic"))
-        self.txt_asr.tag_config("reject", foreground="#b02a37",
-                                font=("Microsoft YaHei", 9, "italic"))
+        self._style_text(self.txt_asr)
+        self.txt_asr.tag_config("idx", foreground=THEME["accent"], font=(mono[0], 9, "bold"))
+        self.txt_asr.tag_config("text", foreground=THEME["fg"],
+                                font=(THEME["font_asr"][0], 11, "bold"))
+        self.txt_asr.tag_config("meta", foreground=THEME["fg_dim"], font=(mono[0], 8))
+        self.txt_asr.tag_config("pending", foreground=THEME["pending"],
+                                font=(THEME["font_asr"][0], 10, "italic"))
+        self.txt_asr.tag_config("reject", foreground=THEME["reject"],
+                                font=(THEME["font_asr"][0], 10, "italic"))
         bot.add(asr_frame, weight=3)
 
     def _add_bar(self, parent, label, key, row, maximum=1.0):
-        ttk.Label(parent, text=label, width=14,
-                  font=("Segoe UI", 9)).grid(row=row, column=0, sticky="w", padx=4, pady=1)
+        ttk.Label(parent, text=label, width=14, font=THEME["font_ui"],
+                  background=THEME["panel"], foreground=THEME["fg_dim"]
+                  ).grid(row=row, column=0, sticky="w", padx=4, pady=2)
         bar = ttk.Progressbar(parent, orient="horizontal", maximum=maximum, length=280)
-        bar.grid(row=row, column=1, sticky="we", padx=4, pady=1)
-        val = ttk.Label(parent, text="0.00", width=10, font=("Consolas", 8))
+        bar.grid(row=row, column=1, sticky="we", padx=4, pady=2)
+        val = ttk.Label(parent, text="0.00", width=10, font=(THEME["font_mono"][0], 9),
+                        background=THEME["panel"], foreground=THEME["accent"])
         val.grid(row=row, column=2, sticky="w", padx=4)
         setattr(self, f"bar_{key}", bar)
         setattr(self, f"lbl_{key}", val)
@@ -328,12 +557,9 @@ class WakeGUI(tk.Tk):
 
     def _update_mode_panels(self):
         mode = self.var_mode.get()
-        state_kws = "normal" if mode == "kws" else "disabled"
         state_vad = "normal" if mode in ("vad", "multimodal") else "disabled"
         state_mm = "normal" if mode == "multimodal" else "disabled"
         try:
-            for w in self.kws_frame.winfo_children():
-                w.configure(state=state_kws)
             for w in self.vad_frame.winfo_children():
                 w.configure(state=state_vad)
             for w in self.mm_frame.winfo_children():
@@ -346,13 +572,12 @@ class WakeGUI(tk.Tk):
             return
         device = self._selected_device()
         mode = self.var_mode.get()
-        wake = self.cmb_wake.get() or "hey_jarvis"
         thresh = float(self.var_thresh.get())
         args = argparse.Namespace(
             device=device,
             list_devices=False,
             mode=mode,
-            wakewords=[wake],
+            wakewords=["hey_jarvis"],
             base_thresh=thresh,
             min_speech_ms=float(self.var_min_speech.get()),
             min_snr_db=float(self.var_min_snr.get()),
@@ -443,11 +668,11 @@ class WakeGUI(tk.Tk):
                 name = self.gate_names.get(k, k)
                 v = gates.get(k)
                 if v is True:
-                    lbl.config(text=f"● {name}", foreground="#2b9348")
+                    lbl.config(text=f"● {name}", foreground=THEME["ok"])
                 elif v is False:
-                    lbl.config(text=f"✗ {name}", foreground="#c0392b")
+                    lbl.config(text=f"✗ {name}", foreground=THEME["bad"])
                 else:
-                    lbl.config(text=f"○ {name}", foreground="#888")
+                    lbl.config(text=f"○ {name}", foreground=THEME["fg_mute"])
         elif ev == "wake":
             cnt = pl.get("count", self.wake_count + 1)
             self.wake_count = cnt
@@ -513,23 +738,28 @@ class WakeGUI(tk.Tk):
                 self.txt_asr.see("end")
         elif ev == "state":
             st = pl["state"]
-            color = "#2b9348" if st == "LISTENING" else "gray"
+            color = THEME["ok"] if st == "LISTENING" else THEME["fg_mute"]
             self.lbl_state.config(text=f"● {st}", foreground=color)
             self._log(f"状态切换 -> {st} ({pl.get('reason', '')})", "info")
         elif ev == "started":
-            self.lbl_state.config(text="● IDLE", foreground="gray")
+            self.lbl_state.config(text="● IDLE", foreground=THEME["accent"])
             extra = ""
             if "audio_channels" in pl:
                 extra = f" channels={pl['audio_channels']} visual={pl.get('visual_on')}"
             self._log(f"监听启动 mode={pl.get('mode')}{extra}", "info")
         elif ev == "stopped":
-            self.lbl_state.config(text="● STOPPED", foreground="gray")
+            self.lbl_state.config(text="● STOPPED", foreground=THEME["fg_mute"])
             self._log("监听已停止", "info")
             self.engine = None
             self.btn_start.config(state="normal")
             self.btn_stop.config(state="disabled")
         elif ev == "interrupt_hint":
             self._log(f"(LISTENING 中再触发，按方案交给打断模块) {pl['word']}={pl['score']:.2f}", "warn")
+        elif ev == "asr_status":
+            if pl.get("ok"):
+                self._log(f"ASR 就绪: backend={pl.get('backend')}", "info")
+            else:
+                self._log(f"ASR 不可用: {pl.get('reason')}", "warn")
 
     def _refresh_preview(self):
         self.after(100, self._refresh_preview)
@@ -550,7 +780,7 @@ class WakeGUI(tk.Tk):
             self._preview_photo = ImageTk.PhotoImage(img)
             self.lbl_preview.config(image=self._preview_photo, text="")
         except Exception as e:
-            self.lbl_preview.config(text=f"preview error: {e}")
+            self.lbl_preview.config(text=f"preview error: {e}", fg=THEME["bad"])
 
     # ------------------------ 日志 & 播放 ------------------------ #
     def _log(self, msg, tag="info"):

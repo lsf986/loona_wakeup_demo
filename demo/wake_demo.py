@@ -289,10 +289,12 @@ class WakeDemo:
         self.on_event = None
         self.stop_flag = threading.Event()
 
-        # ASR（按需懒加载）
+        # ASR（按需懒加载；启动时会在后台线程预加载一次）
         self.wake_count = 0
         self._asr_model = None
         self._asr_backend = None
+        self._asr_error = None         # 最近一次加载失败的可读原因
+        self._asr_loaded_event = threading.Event()  # 预加载完成（无论成功失败）
         self._asr_lock = threading.Lock()
         self._asr_pool = []  # 简单的后台线程列表（用完丢弃）
 
@@ -331,37 +333,56 @@ class WakeDemo:
         优先用 sherpa-onnx + SenseVoiceSmall（中文识别准确率显著优于 whisper tiny/base），
         如未安装或模型文件缺失则回退到 faster-whisper。
         返回 (model, backend_name) 二元组，backend_name ∈ {'sensevoice','whisper',None}。
+        加载失败时会把可读的错误原因写到 self._asr_error。
         """
         with self._asr_lock:
             if self._asr_model is not None:
                 return self._asr_model, self._asr_backend
+            reasons: list[str] = []
             # 首选 SenseVoice
             sv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "models", "sherpa-onnx-sense-voice")
             sv_model = os.path.join(sv_dir, "model.int8.onnx")
             sv_tokens = os.path.join(sv_dir, "tokens.txt")
-            if os.path.isfile(sv_model) and os.path.isfile(sv_tokens):
+            sv_files_ok = os.path.isfile(sv_model) and os.path.isfile(sv_tokens)
+            if not sv_files_ok:
+                reasons.append(
+                    f"SenseVoice 模型文件缺失: 需要 {sv_model} 与 {sv_tokens}"
+                )
+            else:
                 try:
-                    import sherpa_onnx
-                    print(f"[ASR] 加载 sherpa-onnx SenseVoiceSmall ...")
-                    self._asr_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                        model=sv_model,
-                        tokens=sv_tokens,
-                        num_threads=2,
-                        use_itn=True,
-                        language="zh",
+                    import sherpa_onnx  # type: ignore
+                except ImportError:
+                    reasons.append(
+                        "未安装 sherpa-onnx（执行: pip install sherpa-onnx）"
                     )
-                    self._asr_backend = "sensevoice"
-                    print("[ASR] SenseVoice 加载完成")
-                    return self._asr_model, self._asr_backend
-                except Exception as e:
-                    print(f"[ASR] SenseVoice 加载失败，回退 whisper: {e}",
-                          file=sys.stderr)
+                else:
+                    try:
+                        print("[ASR] 加载 sherpa-onnx SenseVoiceSmall ...")
+                        self._asr_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                            model=sv_model,
+                            tokens=sv_tokens,
+                            num_threads=2,
+                            use_itn=True,
+                            language="zh",
+                        )
+                        self._asr_backend = "sensevoice"
+                        self._asr_error = None
+                        print("[ASR] SenseVoice 加载完成")
+                        return self._asr_model, self._asr_backend
+                    except Exception as e:
+                        reasons.append(f"SenseVoice 加载失败: {e}")
+                        print(f"[ASR] SenseVoice 加载失败，尝试回退 whisper: {e}",
+                              file=sys.stderr)
             # 回退：faster-whisper
             try:
                 from faster_whisper import WhisperModel
             except ImportError:
+                reasons.append(
+                    "未安装 faster-whisper（执行: pip install faster-whisper）"
+                )
                 print("[ASR] faster-whisper 未安装，跳过转写", file=sys.stderr)
+                self._asr_error = "；".join(reasons)
                 return None, None
             model_size = getattr(self.args, "asr_model", "base")
             try:
@@ -370,12 +391,32 @@ class WakeDemo:
                     model_size, device="cpu", compute_type="int8"
                 )
                 self._asr_backend = "whisper"
+                self._asr_error = None
                 print("[ASR] Whisper 加载完成")
             except Exception as e:
+                reasons.append(f"Whisper 加载失败: {e}")
                 print(f"[ASR] 加载失败: {e}", file=sys.stderr)
                 self._asr_model = None
                 self._asr_backend = None
+                self._asr_error = "；".join(reasons)
             return self._asr_model, self._asr_backend
+
+    def _preload_asr_async(self):
+        """在后台线程预加载 ASR，避免首个唤醒事件阻塞等待模型加载，
+        同时让不可用错误尽早暴露在日志里。"""
+        def _job():
+            try:
+                model, backend = self._get_asr()
+                if model is None:
+                    reason = self._asr_error or "未知原因"
+                    print(f"[ASR] 预加载失败: {reason}", file=sys.stderr)
+                    self._emit("asr_status", ok=False, reason=reason)
+                else:
+                    self._emit("asr_status", ok=True, backend=backend)
+            finally:
+                self._asr_loaded_event.set()
+        t = threading.Thread(target=_job, daemon=True, name="asr-preload")
+        t.start()
 
     def _transcribe_async(self, pcm_i16: np.ndarray, name: str, score: float,
                           wake_count: int | None = None):
@@ -390,9 +431,11 @@ class WakeDemo:
             model, backend = pair if pair else (None, None)
             if model is None:
                 self._reject_wake(wake_count_snapshot)
+                reason_detail = self._asr_error or "ASR 模型不可用"
                 self._emit("asr", word=name, score=score, text="",
                            count=wake_count_snapshot,
-                           rejected=True, reject_reason="ASR 模型不可用",
+                           rejected=True,
+                           reject_reason=f"ASR 不可用: {reason_detail}",
                            error="model_unavailable")
                 return
             try:
@@ -477,6 +520,8 @@ class WakeDemo:
 
     def run(self):
         try:
+            # 后台预加载 ASR：避免首次唤醒阻塞等待模型，也让不可用错误提前暴露
+            self._preload_asr_async()
             # 尝试按配置打开多通道；若失败退回单通道
             ch = max(1, self.audio_channels)
             try:
@@ -614,19 +659,21 @@ class WakeDemo:
         """
         # 1) 音频"意图证据"必须首先在场：浊音 + SNR
         # 浊音 hangover：每次出现浊音后保留 N 帧"近期浊音"状态，抗短暂停顿
-        if feats.is_voiced and snr >= 3.0:
+        # 灵敏度调整：内部门限更宽松（SNR 1.0 而不是 3.0），hangover 加长到 400ms，
+        # 长静音清零门限放宽到 900ms，避免自然说话停顿把累计置零。
+        if feats.is_voiced and snr >= 1.0:
             self.speech_run_ms += VAD_FRAME_MS
             self.silence_run_ms = 0.0
-            self._voiced_hangover = 12  # 12*20ms = 240ms 尾拖
+            self._voiced_hangover = 20  # 20*20ms = 400ms 尾拖
         else:
             if getattr(self, "_voiced_hangover", 0) > 0:
-                # hangover 内仍推进 speech_run（按一半速率，避免噪声积累）
+                # hangover 内仍推进 speech_run（按 0.75 速率，尽量保留语流）
                 self._voiced_hangover -= 1
-                self.speech_run_ms += VAD_FRAME_MS * 0.5
+                self.speech_run_ms += VAD_FRAME_MS * 0.75
                 self.silence_run_ms = 0.0
             else:
                 self.silence_run_ms += VAD_FRAME_MS
-                if self.silence_run_ms >= 700:  # 长静音才清零
+                if self.silence_run_ms >= 900:  # 长静音才清零
                     self.speech_run_ms = 0.0
 
         min_speech_ms = float(getattr(self.args, "min_speech_ms", 300))
@@ -655,20 +702,22 @@ class WakeDemo:
         near_ok = feats.near_field_ok or (vg.available and vg.near_field)
 
         # 5) 唇-声同步门：最近 1000ms 内
-        #    - “嘴动且发声”的共现帧占音频语音帧 ≥ 50%
-        #    - “发声但嘴没动”的反证帧数 ≤ 共现帧数  ← 抗同事远场语音的核心
+        #    - “嘴动且发声”的共现帧占音频语音帧 ≥ 40%
+        #    - “发声但嘴没动”的反证帧数 ≤ 1.5 × 共现帧数  ← 抗同事远场语音的核心
+        # 灵敏度调整：阈值从 50% 放到 40%，反证系数从 1.0 放到 1.5，
+        # voiced/lip 最小出现次数从 6 放到 4，历史窗口从 300ms 放到 240ms。
         lip_now = bool(vg.available and vg.lip_moving)
         voiced_now = bool(feats.is_voiced)
         self._av_window.append((voiced_now, lip_now))
-        if len(self._av_window) >= 15:  # 至少 300ms 历史
+        if len(self._av_window) >= 12:  # 至少 240ms 历史
             coincide = sum(1 for v, l in self._av_window if v and l)
             voiced_cnt = sum(1 for v, _ in self._av_window if v)
             lip_cnt = sum(1 for _, l in self._av_window if l)
             voiced_only = sum(1 for v, l in self._av_window if v and not l)  # 有声无唇 ≈ 同事语音
             av_sync_ok = (
-                voiced_cnt >= 6 and lip_cnt >= 6
-                and coincide >= max(5, int(0.50 * voiced_cnt))
-                and voiced_only <= coincide  # 反证帧不能超过共现帧
+                voiced_cnt >= 4 and lip_cnt >= 4
+                and coincide >= max(3, int(0.40 * voiced_cnt))
+                and voiced_only <= int(1.5 * coincide) + 1  # 反证帧放宽，允许短暂嘴型遮挡
             )
         else:
             av_sync_ok = False
@@ -697,18 +746,20 @@ class WakeDemo:
         all_pass = all(gates.values())
 
         # 持续命中门限：要求硬门限连续 N 帧保持全绿（抗瞬时误报）
-        SUSTAIN_FRAMES = 10  # 10 * 20ms = 200ms
+        # 灵敏度调整：从 200ms(10 帧) 下调到 100ms(5 帧)，并允许少量抖动（缓慢衰减而非清零）
+        SUSTAIN_FRAMES = 5  # 5 * 20ms = 100ms
         if all_pass:
             self._sustain_pass_frames += 1
         else:
-            self._sustain_pass_frames = 0
+            # 不直接清零：允许单帧抖动（摄像头帧间人脸丢失、DOA 抖）不重置累计
+            self._sustain_pass_frames = max(0, self._sustain_pass_frames - 2)
         sustained = self._sustain_pass_frames >= SUSTAIN_FRAMES
 
         # 防抖 + 冷却 + TTS 抑制
         now = time.time()
         if all_pass and not sustained:
             reason = f"hold {self._sustain_pass_frames}/{SUSTAIN_FRAMES}"
-        elif sustained and (now - self.last_fire) < 2.5:
+        elif sustained and (now - self.last_fire) < 1.5:
             sustained = False
             reason = "veto:debounce"
         elif self.arbiter.tts_playing and sustained:
