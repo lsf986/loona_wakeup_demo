@@ -45,6 +45,20 @@ _MEANINGLESS_CHARS = set("嗯啊哦呃唉哈呀哎嘿噢哇呵咳喂哼唔呣阿
 _PUNCT_CHARS = set(" \t\n\r，。！？、.,!?~～·…—-“”\"'`()（）[]【】《》:;：；")
 
 
+def _strip_punct(text: str) -> str:
+    """去掉 ASR 结果里的标点符号。保留中英文字母与数字之间的单个空格，
+    确保英文短语可读。
+    """
+    if not text:
+        return text
+    # 去除 _PUNCT_CHARS 中定义的所有标点（含中英文常见标点）
+    chars = [ch for ch in text if ch not in _PUNCT_CHARS or ch == " "]
+    # 合并连续空格 & 去首尾空格
+    out = "".join(chars)
+    out = " ".join(out.split())
+    return out
+
+
 def _asr_is_meaningless(text: str) -> tuple[bool, str]:
     """判断 ASR 文本是否应被判为"无效唤醒"。
     返回 (是否无效, 原因描述)。
@@ -258,6 +272,14 @@ class WakeDemo:
         self.speech_run_ms = 0.0
         self.silence_run_ms = 0.0
         self.last_fire = 0.0
+        # 环境画像：噪声等级 + 人数 → 宽/严判决策略
+        self._env_face_hist: collections.deque = collections.deque(maxlen=50)  # ~1s@50fps audio tick
+        self._env_voiced_hist: collections.deque = collections.deque(maxlen=50)
+        self._env_noise_hist: collections.deque = collections.deque(maxlen=100)  # 2s
+        self._env_profile = "normal"   # 'relaxed' | 'normal' | 'strict'
+        self._env_noise_label = "normal"  # 'quiet' | 'normal' | 'noisy'
+        self._env_crowd_label = "none"    # 'none' | 'single' | 'multi'
+        self._last_env_emit = 0.0
         # 最近 1000ms 的 (voiced, lip_moving) 对，用于唇-声同步门
         self._av_window = collections.deque(maxlen=50)  # 50 * 20ms = 1000ms
         # 最近 10 帧（200ms）DOA 是否在锥内，用于做时间迟滞，抗 GCC-PHAT 抖动
@@ -471,7 +493,9 @@ class WakeDemo:
                 if rejected:
                     self._reject_wake(wake_count_snapshot)
                     print(f"[ASR] 判定为无效唤醒: {reject_reason}")
-                self._emit("asr", word=name, score=score, text=text,
+                # 去除标点后再对外暴露（GUI 展示 / 下游使用更干净）
+                clean_text = _strip_punct(text)
+                self._emit("asr", word=name, score=score, text=clean_text,
                            count=wake_count_snapshot, backend=backend,
                            rejected=rejected, reject_reason=reject_reason,
                            language=lang_detected)
@@ -612,11 +636,20 @@ class WakeDemo:
                 self._emit("state", state=self.state, reason="timeout")
 
             if self.mode == "kws":
-                self._process_kws(frame, is_speech, snr, feats)
+                try:
+                    self._process_kws(frame, is_speech, snr, feats)
+                except Exception as e:
+                    print(f"[LOOP-ERR/kws] {e}", file=sys.stderr)
             elif self.mode == "multimodal":
-                self._process_multimodal(is_speech, snr, feats)
+                try:
+                    self._process_multimodal(is_speech, snr, feats)
+                except Exception as e:
+                    print(f"[LOOP-ERR/multimodal] {e}", file=sys.stderr)
             else:
-                self._process_vad(is_speech, snr)
+                try:
+                    self._process_vad(is_speech, snr)
+                except Exception as e:
+                    print(f"[LOOP-ERR/vad] {e}", file=sys.stderr)
 
     # -------- 模式 A：唤醒词路径 -------- #
     def _process_kws(self, frame, is_speech, snr, feats: AudioFeatures):
@@ -649,6 +682,96 @@ class WakeDemo:
                 self._emit("interrupt_hint", word=best_name, score=float(best_score))
 
     # -------- 模式 C：多模态硬门限路径（方案 §5.2 路径 B 正式实现） -------- #
+    def _update_env_profile(self, vg: "VisualGates", voiced_now: bool, snr_db: float):
+        """环境画像：根据噪声底和人脸数量动态选择宽/严策略。
+
+        返回 (profile, snapshot_dict)。profile ∈ {'relaxed','normal','strict'}。
+
+        关键修正：为避免单人安静环境下用户自己说话被当成"嘈杂"，
+        噪声评估只用"voiced 且 用户无唇动"的帧（近似视为外部人声），
+        从而把用户本人的当前语音排除在外。同时把嘈杂阈值抬高。
+
+        判定规则：
+        1) 噪声：
+           - quiet:  noise_rms 2s 均值 < 250 且 other_voice_ratio < 0.15
+           - noisy:  noise_rms > 700 或 other_voice_ratio > 0.55
+           - normal: 其他
+        2) 人数：
+           - single: 近 1s 内 face_count == 1 的帧占比 ≥ 70%
+           - multi:  同窗口 face_count ≥ 2 的帧占比 ≥ 30%
+           - none:   无脸
+        3) profile 合成：
+           - relaxed = quiet + single
+           - strict  = noisy 或 multi
+           - normal  = 其它
+        """
+        # 采样：噪声底、人脸数
+        self._env_noise_hist.append(self.noise.noise_rms)
+        self._env_face_hist.append(int(vg.face_count) if vg.available else 0)
+        # 外部人声证据：voiced 且 用户本人没有在说话（无唇动）
+        # 视觉不可用时无法区分，回退为 voiced
+        if vg.available:
+            other_voice_now = bool(voiced_now and not vg.lip_moving)
+        else:
+            other_voice_now = bool(voiced_now)
+        self._env_voiced_hist.append(1 if other_voice_now else 0)
+
+        # 样本不足时给出中性画像
+        if len(self._env_noise_hist) < 25:  # 0.5s
+            profile = "normal"
+            snap = dict(noise="warmup", crowd="warmup", profile=profile,
+                        noise_rms=float(self.noise.noise_rms),
+                        voiced_ratio=0.0, face_count=0,
+                        single_ratio=0.0, multi_ratio=0.0)
+            return profile, snap
+
+        noise_mean = float(np.mean(self._env_noise_hist))
+        other_voice_ratio = float(np.mean(self._env_voiced_hist))
+        face_arr = np.array(self._env_face_hist)
+        single_ratio = float(np.mean(face_arr == 1))
+        multi_ratio = float(np.mean(face_arr >= 2))
+
+        if noise_mean < 250.0 and other_voice_ratio < 0.15:
+            noise_label = "quiet"
+        elif noise_mean > 700.0 or other_voice_ratio > 0.55:
+            noise_label = "noisy"
+        else:
+            noise_label = "normal"
+
+        if not vg.available:
+            crowd_label = "none"
+        elif multi_ratio >= 0.30:
+            crowd_label = "multi"
+        elif single_ratio >= 0.70:
+            crowd_label = "single"
+        else:
+            crowd_label = "none"
+
+        if noise_label == "quiet" and crowd_label == "single":
+            profile = "relaxed"
+        elif noise_label == "noisy" or crowd_label == "multi":
+            profile = "strict"
+        else:
+            profile = "normal"
+
+        self._env_noise_label = noise_label
+        self._env_crowd_label = crowd_label
+        self._env_profile = profile
+
+        # 变化或节流 1.5s emit 一次，给 GUI 显示
+        now = time.time()
+        if (profile != getattr(self, "_env_last_profile", None)
+                or now - self._last_env_emit > 1.5):
+            self._env_last_profile = profile
+            self._last_env_emit = now
+            self._emit("env", profile=profile, noise=noise_label, crowd=crowd_label,
+                       noise_rms=noise_mean, voiced_ratio=other_voice_ratio,
+                       single_ratio=single_ratio, multi_ratio=multi_ratio)
+
+        return profile, dict(noise=noise_label, crowd=crowd_label, profile=profile,
+                             noise_rms=noise_mean, voiced_ratio=other_voice_ratio,
+                             single_ratio=single_ratio, multi_ratio=multi_ratio)
+
     def _process_multimodal(self, is_speech, snr, feats: AudioFeatures):
         """注视 + 唇动 + DOA + 近场 四硬门限全命中才触发。
 
@@ -743,23 +866,65 @@ class WakeDemo:
             # 非严格：视觉门限自动放行（此时近似退化为 VAD 模式+强噪声抑制）
             gates["face"] = gates["gaze"] = gates["lip"] = gates["av_sync"] = True
 
-        all_pass = all(gates.values())
+        # ===== 环境画像：根据噪声/人数选择宽/严策略（方案"添加权重"） ===== #
+        profile, env_snap = self._update_env_profile(vg, voiced_now, snr)
 
-        # 持续命中门限：要求硬门限连续 N 帧保持全绿（抗瞬时误报）
-        # 灵敏度调整：从 200ms(10 帧) 下调到 100ms(5 帧)，并允许少量抖动（缓慢衰减而非清零）
-        SUSTAIN_FRAMES = 5  # 5 * 20ms = 100ms
+        # 每个 profile 定义：必需门 + 可选门(权重) + 可选分阈值 + SUSTAIN + debounce
+        # 必需门全 True 才视为"基线满足"；可选门的加权和 ≥ 阈值才视为"证据充分"
+        # 总原则：越嘈杂/越多人，把更多门变为必需 + 抬高 gaze 等权重，越安静单人越放宽
+        if profile == "relaxed":
+            # 安静 + 单人：只要有"部分朝向 + 清晰语句"即可
+            # 必需：voiced、speech_run、face（看见人）
+            # 可选加分：gaze(0.9)、lip(0.8)、near_field(0.7)、av_sync(0.6)、snr(0.5)、doa(0.3)
+            required = ["voiced", "speech_run", "face"]
+            weights = {"gaze": 0.9, "lip": 0.8, "near_field": 0.7,
+                       "av_sync": 0.6, "snr": 0.5, "doa": 0.3}
+            optional_thresh = 1.4    # ~= 两项通过（如 gaze+near 或 lip+snr）
+            sustain_frames = 3       # 60ms
+            debounce_s = 1.0
+        elif profile == "strict":
+            # 嘈杂 / 多人：全部硬门限 + 抬高 gaze 权重（注视权重 ×1.8）
+            required = ["voiced", "snr", "speech_run", "face", "gaze",
+                        "lip", "near_field", "av_sync"]
+            weights = {"gaze": 1.8, "doa": 1.2, "av_sync": 1.2}
+            optional_thresh = 0.0    # 所有必需门已覆盖，权重仅影响持续帧数
+            sustain_frames = 7       # 140ms，更严
+            debounce_s = 2.0
+            # SNR 在 strict 下再抬高 2dB，对应方案 §5.3 的嘈杂抬阈
+            min_snr_eff = min_snr_db + 2.0
+            gates["snr"] = snr >= min_snr_eff
+        else:
+            # normal：当前策略（全部硬门限 AND）
+            required = ["voiced", "snr", "speech_run", "face", "gaze",
+                        "lip", "near_field", "av_sync"]
+            weights = {}
+            optional_thresh = 0.0
+            sustain_frames = 5       # 100ms
+            debounce_s = 1.5
+
+        # 必需门是否全通过
+        required_ok = all(gates.get(k, False) for k in required)
+        # 可选门的加权得分：仅计算不在 required 里的门
+        optional_score = sum(w for k, w in weights.items()
+                             if k not in required and gates.get(k, False))
+        # 综合判决
+        evidence_ok = required_ok and (optional_score >= optional_thresh)
+        # 兼容原有 "all_pass" 语义：normal/strict 下其实就是全通过
+        all_pass = evidence_ok
+
+        # 持续命中门限：按 profile 定长；不直接清零，允许单帧抖动
+        SUSTAIN_FRAMES = sustain_frames
         if all_pass:
             self._sustain_pass_frames += 1
         else:
-            # 不直接清零：允许单帧抖动（摄像头帧间人脸丢失、DOA 抖）不重置累计
             self._sustain_pass_frames = max(0, self._sustain_pass_frames - 2)
         sustained = self._sustain_pass_frames >= SUSTAIN_FRAMES
 
         # 防抖 + 冷却 + TTS 抑制
         now = time.time()
         if all_pass and not sustained:
-            reason = f"hold {self._sustain_pass_frames}/{SUSTAIN_FRAMES}"
-        elif sustained and (now - self.last_fire) < 1.5:
+            reason = f"hold {self._sustain_pass_frames}/{SUSTAIN_FRAMES}({profile})"
+        elif sustained and (now - self.last_fire) < debounce_s:
             sustained = False
             reason = "veto:debounce"
         elif self.arbiter.tts_playing and sustained:
@@ -768,11 +933,16 @@ class WakeDemo:
                 sustained = False
                 reason = "veto:tts-playing"
             else:
-                reason = "ok"
+                reason = f"ok({profile})"
         else:
-            # 找第一个未通过的门
-            failed = [k for k, v in gates.items() if not v]
-            reason = "ok" if sustained else f"veto:{','.join(failed)}"
+            # 找第一个未通过的必需门或诊断出缺少可选分
+            failed = [k for k in required if not gates.get(k, False)]
+            if not failed and not evidence_ok:
+                reason = (f"veto:opt<{optional_thresh:.1f}"
+                          f"(got={optional_score:.1f},{profile})")
+            else:
+                reason = (f"ok({profile})" if sustained
+                          else f"veto:{','.join(failed)}({profile})")
 
         # 诊断：当有浊音时每 1.5s 打印一次门限状态，帮助定位哪个门在挡
         if is_speech:
@@ -797,8 +967,10 @@ class WakeDemo:
                         lip=vg.lip_moving,
                         face_area=vg.face_area_ratio,
                         offset=vg.face_center_offset,
-                        lip_std=vg.lip_motion_std, fps=vg.fps),
+                        lip_std=vg.lip_motion_std, fps=vg.fps,
+                        face_count=vg.face_count),
             gates=gates,
+            env=env_snap,
         )
 
         if not all_pass:

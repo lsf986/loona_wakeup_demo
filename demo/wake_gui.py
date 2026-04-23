@@ -448,6 +448,11 @@ class WakeGUI(tk.Tk):
             font=(mono[0], 8), foreground=THEME["fg_dim"],
             background=THEME["panel"])
         self.lbl_audio_diag.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
+        self.lbl_env = ttk.Label(mon,
+            text="环境: --- / --- → ---",
+            font=(mono[0], 9, "bold"), foreground=THEME["accent"],
+            background=THEME["panel"])
+        self.lbl_env.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
         mon.columnconfigure(1, weight=1)
 
         # ============ 硬门限灯排（全宽，紧凑） ============
@@ -760,6 +765,21 @@ class WakeGUI(tk.Tk):
                 self._log(f"ASR 就绪: backend={pl.get('backend')}", "info")
             else:
                 self._log(f"ASR 不可用: {pl.get('reason')}", "warn")
+        elif ev == "env":
+            profile = pl.get("profile", "?")
+            noise = pl.get("noise", "?")
+            crowd = pl.get("crowd", "?")
+            color = {"relaxed": THEME["ok"], "strict": THEME["bad"],
+                     "normal": THEME["accent"]}.get(profile, THEME["fg_dim"])
+            self.lbl_env.config(
+                text=f"环境: {noise}/{crowd} → {profile}  "
+                     f"[RMS≈{pl.get('noise_rms', 0):.0f}  "
+                     f"others={pl.get('voiced_ratio', 0)*100:.0f}%  "
+                     f"single={pl.get('single_ratio', 0)*100:.0f}%  "
+                     f"multi={pl.get('multi_ratio', 0)*100:.0f}%]",
+                foreground=color,
+            )
+            self._log(f"环境画像切换: {noise}/{crowd} → {profile}", "info")
 
     def _refresh_preview(self):
         self.after(100, self._refresh_preview)

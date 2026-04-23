@@ -42,6 +42,8 @@ class VisualGates:
     face_center_offset: float = 0.0  # [-1,1]，0=居中
     lip_motion_std: float = 0.0
     fps: float = 0.0
+    # 环境感知：人数
+    face_count: int = 0
 
 
 class VisualFrontend:
@@ -200,6 +202,7 @@ class VisualFrontend:
                 face_center_offset=center_offset,
                 lip_motion_std=lip_std,
                 fps=fps,
+                face_count=int(len(faces)) if face_present else 0,
             )
             with self._lock:
                 self._latest_gates = gates
