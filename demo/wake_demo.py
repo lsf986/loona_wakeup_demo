@@ -191,6 +191,105 @@ class NoiseTracker:
         return 20.0 * np.log10((frame_rms + 1e-6) / (self.noise_rms + 1e-6))
 
 
+# ------------------------------ Speaker Tracker ------------------------------ #
+class SpeakerTracker:
+    """轻量声纹追踪：按基频/频谱重心对最近若干"语句"做粗分群。
+
+    实现动机：真实声纹模型（ECAPA/resemblyzer 等）体积大、推理开销高，
+    本 demo 只需要在"过去几秒内听到几位不同的说话人"这个粒度做判定，
+    用于驱动多人场景（strict profile）。因此采用一组对人耳频谱差异敏感、
+    完全基于 numpy 的启发式特征：
+
+        - voiced 帧的 pitch_hz（中位数 & IQR）
+        - voiced 帧的 spectral_centroid（中位数 & IQR）
+
+    两句声音被判定为"同一说话人"的条件：
+        | pitch_semitones | < pitch_tol 且 | centroid | < centroid_tol
+    否则视为新说话人并加入 roster。
+
+    保留窗口 retention_s：超过该窗口未再出现的说话人会被移除。
+    """
+
+    PITCH_TOL_ST = 2.5        # semitones
+    CENT_TOL_HZ = 500.0
+    MIN_UTT_FRAMES = 6        # 至少 120ms voiced 才算一句
+    SILENCE_FRAMES = 20       # 连续 400ms 静音视为一句说完
+
+    def __init__(self, retention_s: float = 8.0):
+        self.retention_s = retention_s
+        self._buf_pitch: list[float] = []
+        self._buf_cent: list[float] = []
+        self._silence_run = 0
+        # roster: list[dict(id, ts, pitch, cent)]
+        self._roster: list[dict] = []
+        self._next_id = 0
+
+    def _flush_utterance(self) -> int | None:
+        """把当前累计帧收成一句，返回 speaker_id（或 None 如果帧数不足）。"""
+        if len(self._buf_pitch) < self.MIN_UTT_FRAMES:
+            self._buf_pitch.clear(); self._buf_cent.clear()
+            return None
+        p_med = float(np.median(self._buf_pitch))
+        c_med = float(np.median(self._buf_cent))
+        self._buf_pitch.clear(); self._buf_cent.clear()
+
+        now = time.time()
+        # 回收过期说话人
+        self._roster = [r for r in self._roster if now - r["ts"] <= self.retention_s]
+
+        best_id: int | None = None
+        best_d = float("inf")
+        for r in self._roster:
+            if r["pitch"] <= 0 or p_med <= 0:
+                continue
+            semitones = abs(12.0 * np.log2(p_med / r["pitch"]))
+            cent_d = abs(c_med - r["cent"])
+            if semitones < self.PITCH_TOL_ST and cent_d < self.CENT_TOL_HZ:
+                score = semitones / self.PITCH_TOL_ST + cent_d / self.CENT_TOL_HZ
+                if score < best_d:
+                    best_d = score
+                    best_id = r["id"]
+
+        if best_id is None:
+            best_id = self._next_id
+            self._next_id += 1
+            self._roster.append(dict(id=best_id, ts=now, pitch=p_med, cent=c_med))
+        else:
+            for r in self._roster:
+                if r["id"] == best_id:
+                    # EMA 更新模板，适应音调漂移
+                    r["ts"] = now
+                    r["pitch"] = 0.7 * r["pitch"] + 0.3 * p_med
+                    r["cent"] = 0.7 * r["cent"] + 0.3 * c_med
+                    break
+        return best_id
+
+    def feed(self, is_voiced: bool, pitch_hz: float, spec_centroid: float) -> int | None:
+        """每帧调用。返回 speaker_id 仅在刚好完成一句时非 None。"""
+        if is_voiced and pitch_hz > 0:
+            self._buf_pitch.append(float(pitch_hz))
+            self._buf_cent.append(float(spec_centroid))
+            self._silence_run = 0
+            return None
+        # silence
+        if self._buf_pitch:
+            self._silence_run += 1
+            if self._silence_run >= self.SILENCE_FRAMES:
+                sid = self._flush_utterance()
+                self._silence_run = 0
+                return sid
+        return None
+
+    def distinct_recent(self, window_s: float = 6.0) -> int:
+        now = time.time()
+        return len({r["id"] for r in self._roster if now - r["ts"] <= window_s})
+
+    def snapshot(self, window_s: float = 6.0) -> dict:
+        now = time.time()
+        active = [r for r in self._roster if now - r["ts"] <= window_s]
+        return dict(distinct=len(active), ids=[r["id"] for r in active])
+
+
 # ------------------------------ Wake Arbiter ------------------------------ #
 @dataclass
 class WakeDecision:
@@ -353,6 +452,9 @@ class WakeDemo:
         self._env_noise_label = "normal"  # 'quiet' | 'normal' | 'noisy'
         self._env_crowd_label = "none"    # 'none' | 'single' | 'multi'
         self._last_env_emit = 0.0
+        # 声纹追踪：基于 pitch+centroid 的轻量说话人聚类，驱动"多人场景"判定
+        self.speakers = SpeakerTracker(retention_s=8.0)
+        self._speakers_distinct = 0
         # 最近 1000ms 的 (voiced, lip_moving) 对，用于唇-声同步门
         self._av_window = collections.deque(maxlen=50)  # 50 * 20ms = 1000ms
         # 最近 10 帧（200ms）DOA 是否在锥内，用于做时间迟滞，抗 GCC-PHAT 抖动
@@ -1030,6 +1132,11 @@ class WakeDemo:
             # 增强音频特征（HPF、浊音、频谱重心、DOA、近场）
             feats = self.audio_fe.process(frame, ref)
 
+            # 声纹追踪：把 voiced 帧喂给 SpeakerTracker，按句聚类
+            self.speakers.feed(bool(feats.is_voiced), float(feats.pitch_hz or 0.0),
+                               float(feats.spec_centroid or 0.0))
+            self._speakers_distinct = self.speakers.distinct_recent(6.0)
+
             # 如果采集器开启：无论当前模式是否是 multimodal，都抓一次视觉快照
             # （采集始终记录音视频+特征，方便后续 auto_tune）
             if self._collector is not None:
@@ -1153,6 +1260,11 @@ class WakeDemo:
         else:
             crowd_label = "none"
 
+        # 声纹：短时间内听到 ≥2 位不同说话人 → 强制标记多人
+        speakers_distinct = int(self._speakers_distinct)
+        if speakers_distinct >= 2:
+            crowd_label = "multi"
+
         if noise_label == "quiet" and crowd_label == "single":
             profile = "relaxed"
         elif noise_label == "noisy" or crowd_label == "multi":
@@ -1172,11 +1284,13 @@ class WakeDemo:
             self._last_env_emit = now
             self._emit("env", profile=profile, noise=noise_label, crowd=crowd_label,
                        noise_rms=noise_mean, voiced_ratio=other_voice_ratio,
-                       single_ratio=single_ratio, multi_ratio=multi_ratio)
+                       single_ratio=single_ratio, multi_ratio=multi_ratio,
+                       speakers_distinct=speakers_distinct)
 
         return profile, dict(noise=noise_label, crowd=crowd_label, profile=profile,
                              noise_rms=noise_mean, voiced_ratio=other_voice_ratio,
-                             single_ratio=single_ratio, multi_ratio=multi_ratio)
+                             single_ratio=single_ratio, multi_ratio=multi_ratio,
+                             speakers_distinct=speakers_distinct)
 
     def _process_multimodal(self, is_speech, snr, feats: AudioFeatures):
         """注视 + 唇动 + DOA + 近场 四硬门限全命中才触发。
@@ -1275,6 +1389,23 @@ class WakeDemo:
         # ===== 环境画像：根据噪声/人数选择宽/严策略（方案"添加权重"） ===== #
         profile, env_snap = self._update_env_profile(vg, voiced_now, snr)
 
+        # 多人场景（视觉 ≥2 张脸 或 声纹 ≥2 位说话人）下收紧 av_sync：
+        #   - 使用 500ms 窗，共现 ≥ 45%、反证帧 ≤ 共现+2
+        #   - VisualFrontend 只对主脸做唇动检测，所以只有主脸真在说话才会通过
+        if vg.available and (vg.face_count >= 2
+                             or env_snap.get("speakers_distinct", 0) >= 2):
+            if len(self._av_window) >= 25:  # 500ms
+                _co = sum(1 for v, l in self._av_window if v and l)
+                _vc = sum(1 for v, _ in self._av_window if v)
+                _vo = sum(1 for v, l in self._av_window if v and not l)
+                gates["av_sync"] = (
+                    _vc >= 5
+                    and _co >= max(3, int(0.45 * _vc))
+                    and _vo <= _co + 2
+                )
+            else:
+                gates["av_sync"] = False
+
         # 每个 profile 的权重表：默认值 + 可被 auto_tune 配置覆盖。
         # 配置来源: self._tuned_cfg['profiles'][profile]，若不存在则用内置默认。
         prof_cfg = self._resolve_profile_cfg(profile)
@@ -1283,6 +1414,20 @@ class WakeDemo:
         optional_thresh = float(prof_cfg["optional_thresh"])
         sustain_frames = int(prof_cfg["sustain_frames"])
         debounce_s = float(prof_cfg["debounce_s"])
+
+        # ===== 多人即时加固 =====
+        # 只要当前画面里出现 ≥2 张脸，或声纹窗口内出现 ≥2 位说话人，
+        # 就立即（不等 env profile 积累）强制把 gaze/lip/av_sync/face 纳入必需门，
+        # 并抬高 sustain_frames / debounce，避免旁观者或他人说话蹭唤醒。
+        multi_face_now = bool(vg.available and vg.face_count >= 2)
+        multi_speaker_now = int(env_snap.get("speakers_distinct", 0)) >= 2
+        if multi_face_now or multi_speaker_now:
+            for k in ("voiced", "snr", "speech_run", "face",
+                      "gaze", "lip", "near_field", "av_sync"):
+                if k not in required:
+                    required.append(k)
+            sustain_frames = max(sustain_frames, 7)
+            debounce_s = max(debounce_s, 2.0)
 
         if profile == "strict":
             # SNR 在 strict 下再抬高 2dB，对应方案 §5.3 的嘈杂抬阈

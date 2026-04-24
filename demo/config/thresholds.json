@@ -1,16 +1,16 @@
 {
-  "near_field_rms": 1716.744,
+  "near_field_rms": 1715.949,
   "min_snr_db": 20.0,
-  "face_area_min": 0.119,
-  "lip_motion_thresh": 1.628,
+  "face_area_min": 0.121,
+  "lip_motion_thresh": 1.614,
   "profiles": {
     "relaxed": {
       "weights": {
         "gaze": 0.9,
-        "lip": 0.651,
-        "near_field": 0.713,
-        "av_sync": 0.571,
-        "snr": 0.545,
+        "lip": 0.727,
+        "near_field": 0.7,
+        "av_sync": 0.578,
+        "snr": 0.519,
         "doa": 0.3
       }
     },
@@ -18,7 +18,7 @@
       "weights": {
         "gaze": 1.8,
         "doa": 1.2,
-        "av_sync": 1.142
+        "av_sync": 1.156
       }
     }
   }
